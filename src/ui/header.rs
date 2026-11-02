@@ -13,7 +13,7 @@ use crate::{
 
 pub fn draw(f: &mut Frame, area: Rect, view: View) {
     let view_label = match view {
-        View::Agent => "agent",
+        View::Agent => "oxigolem",
         View::Output => "terminal",
     };
 
@@ -34,7 +34,7 @@ pub fn draw(f: &mut Frame, area: Rect, view: View) {
     ]))
     .block(
         Block::default()
-            .borders(Borders::BOTTOM)
+            .borders(Borders::TOP)
             .border_style(Style::default().fg(FAINT)),
     );
     f.render_widget(header, area);
