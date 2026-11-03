@@ -51,7 +51,7 @@ fn hsv_primary_hues() {
 #[test]
 fn hsv_desaturated_is_gray() {
     for hue in [0.0, 37.0, 199.0, 359.0] {
-        let (Color::Rgb(r, g, b_a)) = oxigolem::ui::header::hsv_to_rgb(hue, 0.0, 0.8) else {
+        let Color::Rgb(r, g, b_a) = oxigolem::ui::header::hsv_to_rgb(hue, 0.0, 0.8) else {
             panic!("hsv_to_rgb must return Rgb");
         };
         assert_eq!(r, g, "s=0 → gray (hue {hue})");
