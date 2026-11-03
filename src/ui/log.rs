@@ -115,7 +115,9 @@ fn shade(live: bool, col: usize, tick: u64) -> Color {
     if !live {
         return FAINT;
     }
-    let Color::Rgb(r1, g1, b1) = ORANGE else { return ORANGE };
+    // Base of the wave is a light, near-white orange so the shimmer reads
+    // as a soft glow rather than a deep orange wash.
+    let (r1, g1, b1) = (255, 170, 120);
     let Color::Rgb(r2, g2, b2) = THINK_HOT else { return THINK_HOT };
     // Period ~24 columns; phase sweeps fast left→right with the frame count.
     let phase = (col as f32 - tick as f32 * 3.2) * (std::f32::consts::TAU / 24.0);
