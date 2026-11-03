@@ -114,6 +114,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             app.chat_busy(),
             app.tick,
             app.scroll_back,
+            app.gen_done_tick,
         ),
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }

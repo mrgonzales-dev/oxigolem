@@ -53,6 +53,9 @@ pub struct App {
     /// Manual scrollback offset (visual rows up from the bottom).
     /// `None` = follow newest; `Some(n)` = pinned n rows up.
     pub scroll_back: Option<u16>,
+    /// Tick when the last generation finished — drives the shimmer→dim
+    /// fade so thinking text eases out instead of snapping.
+    pub gen_done_tick: Option<u64>,
 }
 
 impl App {
@@ -70,6 +73,7 @@ impl App {
             chat: None,
             tick: 0,
             scroll_back: None,
+            gen_done_tick: None,
         }
     }
 
@@ -324,6 +328,7 @@ impl App {
                         .rev()
                         .collect();
                     engine.record_assistant(text);
+                    self.gen_done_tick = Some(self.tick);
                 }
                 ChatEvent::Error(e) => {
                     while let Some(last) = self.transcript.last()
