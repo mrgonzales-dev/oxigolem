@@ -58,7 +58,7 @@ fn doctor_without_connection_reports_no_model() {
     press(&mut app, KeyCode::Enter);
     assert!(app.modal.is_none());
     let last = app.transcript.last().expect("a report entry was pushed");
-    assert_eq!(last.role, Role::Tool);
+    assert_eq!(last.role, Role::Report);
     assert!(last.text.contains("/doctor"));
     assert!(last.text.contains("no model connected"));
 }

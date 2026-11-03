@@ -27,6 +27,10 @@ pub enum Role {
     Thinking,
     Golem,
     Tool,
+    /// Verbatim multi-line block (e.g. `/doctor` output) — dimmed, no
+    /// tool-call chrome. Distinct from `Tool` so a report never picks
+    /// up the `● bash · $ cmd` header by accident.
+    Report,
 }
 
 #[derive(Clone)]
@@ -233,7 +237,7 @@ impl App {
             Kind::Palette if choice.starts_with("/doctor") => {
                 let report = self.doctor_report();
                 self.transcript.push(TranscriptEntry {
-                    role: Role::Tool,
+                    role: Role::Report,
                     text: report,
                     outcome: None,
                     expanded: true,

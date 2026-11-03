@@ -129,6 +129,18 @@ pub fn draw(
                 }
                 lines.push(Line::default());
             }
+            Role::Report => {
+                // Verbatim multi-line block — used by `/doctor` and
+                // other self-reports. Rendered dim with the standard
+                // indent; no tool chrome since there's no command.
+                for l in entry.text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled(format!("{pad}  "), Style::default()),
+                        Span::styled(l.to_string(), Style::default().fg(FAINT)),
+                    ]));
+                }
+                lines.push(Line::default());
+            }
             Role::Tool => {
                 // Cursor-cli style: a header `● bash · $ cmd`, an
                 // indented body of stdout + `! ` stderr lines, and an
