@@ -4,8 +4,11 @@ use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// Max time a single command may run before being killed.
-const TIMEOUT: Duration = Duration::from_secs(30);
+/// Max time a foreground command may block the agent before the tool
+/// returns early and the process keeps running as a background shell.
+/// Not a kill deadline — the process is never touched; `wait_bg`
+/// returns `None` past this and the caller demotes the shell instead.
+const BLOCK_BUDGET: Duration = Duration::from_secs(120);
 
 /// Max output chars kept per command — head and tail with a gap marker.
 /// Used by `to_text` (the flat form for the terminal view + tool message
@@ -46,7 +49,7 @@ impl ShellResult {
             return s;
         }
         if self.timed_out {
-            s.push_str(&format!("! timed out after {}s", TIMEOUT.as_secs()));
+            s.push_str(&format!("! timed out after {}s", self.duration.as_secs()));
             return s;
         }
         s.push_str(&self.stdout);
@@ -175,7 +178,7 @@ impl Shell {
         });
         let rx = drx;
 
-        let (out, err, status) = match rx.recv_timeout(TIMEOUT) {
+        let (out, err, status) = match rx.recv_timeout(BLOCK_BUDGET) {
             Ok(v) => v,
             Err(_) => {
                 unsafe {
@@ -474,11 +477,13 @@ impl Shell {
         Ok(shell)
     }
 
-    /// Poll a shell until it exits, times out, or `demote` fires.
-    /// Finished → `ShellResult` rebuilt from the log files (full
-    /// streams, capped at MAX_CAPTURE). Timeout → process group
-    /// killed, `timed_out` result. Demote → `None`; the caller marks
-    /// the shell non-transient and tells the model where to find it.
+    /// Poll a shell until it exits, `demote` fires, or the block
+    /// budget is spent. Finished → `ShellResult` rebuilt from the log
+    /// files (full streams, capped at MAX_CAPTURE). Demote or budget
+    /// expiry → `None`; the caller marks the shell non-transient and
+    /// tells the model where to find it. The process is never killed
+    /// here — the block budget bounds how long the AGENT waits, not
+    /// how long the command runs.
     pub fn wait_bg(
         &self,
         bg: &Arc<BgShell>,
@@ -524,25 +529,13 @@ impl Shell {
             if demote.load(std::sync::atomic::Ordering::Relaxed) {
                 return None;
             }
-            if started.elapsed() >= TIMEOUT {
-                unsafe {
-                    let my_pgid = libc::getpgid(0);
-                    let child_pgid = libc::getpgid(bg.pgid);
-                    if child_pgid != my_pgid {
-                        libc::kill(-child_pgid, libc::SIGKILL);
-                    } else {
-                        libc::kill(bg.pgid, libc::SIGKILL);
-                    }
-                }
-                *bg.status.lock().unwrap() = BgStatus::Killed;
-                return Some(ShellResult {
-                    stdout: read_capped(std::path::Path::new(&bg.log_path), MAX_CAPTURE),
-                    stderr: read_capped(std::path::Path::new(&bg.err_path), MAX_CAPTURE),
-                    code: None,
-                    duration: started.elapsed(),
-                    timed_out: true,
-                    error: None,
-                });
+            // Block budget spent — the tool returns early (`None`) and
+            // the caller demotes the shell: it keeps running as a
+            // normal background tab and the model gets its id + log
+            // path. The process is never killed; a real deadline needs
+            // an explicit `timeout N cmd` in the command itself.
+            if started.elapsed() >= BLOCK_BUDGET {
+                return None;
             }
             std::thread::sleep(Duration::from_millis(20));
         }

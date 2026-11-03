@@ -245,9 +245,16 @@ pub fn draw(
                     }
 
                     // Footer — `✓ exit 0 · 0.04s` on success, `✗ exit N` on
-                    // nonzero, `✗ timed out` when killed, `✗ <error>` on
+                    // nonzero, `⏳ still running` on demote/block-budget,
+                    // `✗ timed out` when killed, `✗ <error>` on
                     // spawn/missing-command failures.
-                    let (mark, summary, color) = if out.result.timed_out {
+                    let (mark, summary, color) = if out.demoted {
+                        (
+                            "⏳",
+                            "still running as background shell".to_string(),
+                            ORANGE_DIM,
+                        )
+                    } else if out.result.timed_out {
                         (
                             "✗",
                             format!("timed out after {}s", out.result.duration.as_secs()),

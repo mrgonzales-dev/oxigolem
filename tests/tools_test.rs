@@ -40,20 +40,38 @@ fn bash_captures_stderr_and_exit_code() {
 }
 
 #[test]
-fn bash_times_out_on_runaway() {
+fn bash_demote_returns_shell_id_not_kill() {
+    // Demote (Ctrl+B×2 or block-budget) must leave the process running
+    // and hand the caller a shell id + log path — never a kill.
+    unsafe {
+        std::env::set_var("OXIGOLEM_JOBS_DIR", "/tmp/oxi-test-jobs-nk");
+    }
+    std::fs::create_dir_all("/tmp/oxi-test-jobs-nk").ok();
     let (sh, shells, demote) = rig();
-    let start = std::time::Instant::now();
-    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "sleep 60"}));
-    assert!(
-        start.elapsed() < std::time::Duration::from_secs(45),
-        "should not wait the full sleep"
-    );
-    assert!(out.result.timed_out, "got: {:?}", out.result);
-    assert!(out.result.code.is_none());
-    assert!(out.to_tool_message().contains("timed out"));
-    // Timed-out foreground shell is removed from the registry — the
-    // process is dead, no live tab to keep around.
-    assert_eq!(shells.lock().unwrap().len(), 0);
+    let shells2 = Arc::clone(&shells);
+    let demote2 = Arc::clone(&demote);
+    let sh2 = sh.clone();
+    let h = std::thread::spawn(move || {
+        tools::execute(&sh2, &shells2, &demote2, "bash", &serde_json::json!({"command": "sleep 30"}))
+    });
+    for _ in 0..100 {
+        if shells.lock().unwrap().len() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    demote.store(true, Ordering::Relaxed);
+    let out = h.join().expect("execute returned");
+    assert!(out.demoted, "outcome must flag demote, got: {:?}", out.result);
+    // Shell survives — still running in the registry, not killed.
+    let reg = shells.lock().unwrap();
+    assert_eq!(reg.len(), 1);
+    assert_eq!(reg[0].status(), BgStatus::Running);
+    // Tool message names the shell id + log so the model can poll.
+    let msg = out.to_tool_message();
+    assert!(msg.contains(&reg[0].id), "got: {msg}");
+    assert!(msg.contains(".log"), "got: {msg}");
+    reg[0].kill();
 }
 
 #[test]
@@ -305,7 +323,8 @@ fn demote_turns_foreground_call_into_bg_shell() {
     let out = h.join().expect("execute returned");
     // Demoted → early return carrying the shell id + log path.
     assert_eq!(out.result.code, Some(0));
-    assert!(out.result.stdout.contains("demoted"), "got: {}", out.result.stdout);
+    assert!(out.demoted, "outcome must flag demote");
+    assert!(out.result.stdout.contains("still running"), "got: {}", out.result.stdout);
     let id = shells.lock().unwrap()[0].id.clone();
     assert!(out.result.stdout.contains(&id), "got: {}", out.result.stdout);
     // Shell stays in the registry, no longer transient, still running.

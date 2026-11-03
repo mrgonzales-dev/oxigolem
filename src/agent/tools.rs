@@ -14,10 +14,11 @@ pub fn specs() -> Vec<ToolSpec> {
         name: "bash",
         description: "Run a bash command on the user's Linux machine. \
                       Shares one shell session with the user — working \
-                      directory and side effects persist. Set \
-                      run_in_background for long-running processes \
-                      (servers, watchers): it returns immediately with \
-                      a shell id and log path you can poll.",
+                      directory and side effects persist. Commands that \
+                      outlive the 120s block budget keep running as a \
+                      background shell and you get an id + log path to \
+                      poll. Prefer run_in_background for servers and \
+                      watchers: it returns immediately.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -72,6 +73,10 @@ pub struct ToolOutcome {
     /// Set by `to_tool_message` when the combined output exceeded
     /// INLINE_CAP: the path the full output was written to.
     pub spilled: Option<String>,
+    /// True when the tool returned early but the process is still
+    /// running as a background shell — Ctrl+B×2 demote or block-budget
+    /// expiry. UI renders `⏳` instead of `✓/✗`.
+    pub demoted: bool,
 }
 
 impl ToolOutcome {
@@ -211,6 +216,7 @@ pub fn execute(
                 error: Some(msg),
             },
             spilled: None,
+            demoted: false,
         }
     }
 
@@ -255,10 +261,11 @@ pub fn execute(
                         error: None,
                     },
                     spilled: None,
+                    demoted: false,
                 };
             }
 
-            // Foreground: wait for exit / timeout / demote.
+            // Foreground: wait for exit / demote / block-budget expiry.
             match shell.wait_bg(&bgshell, demote) {
                 Some(result) => {
                     shells.lock().unwrap().retain(|s| s.id != bgshell.id);
@@ -274,10 +281,13 @@ pub fn execute(
                         command: cmd,
                         result,
                         spilled,
+                        demoted: false,
                     }
                 }
                 None => {
-                    // Demoted — keep it running as a normal bg shell.
+                    // Demoted (Ctrl+B×2 or block budget) — keep it
+                    // running as a normal bg shell and hand the model
+                    // the id + log path it can poll.
                     bgshell
                         .transient
                         .store(false, std::sync::atomic::Ordering::Relaxed);
@@ -285,8 +295,9 @@ pub fn execute(
                         command: cmd,
                         result: ShellResult {
                             stdout: format!(
-                                "demoted to bg shell {id} — log: {}",
-                                bgshell.log_path
+                                "still running as bg shell {id} — log: {}\n\
+                                 Poll it with `tail {}` or check back later.",
+                                bgshell.log_path, bgshell.log_path
                             ),
                             stderr: String::new(),
                             code: Some(0),
@@ -295,6 +306,7 @@ pub fn execute(
                             error: None,
                         },
                         spilled: None,
+                        demoted: true,
                     }
                 }
             }
