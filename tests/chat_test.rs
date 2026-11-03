@@ -704,3 +704,141 @@ fn app_chat_error_goes_to_transcript() {
         last.text
     );
 }
+
+#[test]
+fn enter_while_busy_queues_prompt() {
+    // Provider that streams slowly so we can enqueue mid-generation.
+    struct SlowProvider;
+    impl Provider for SlowProvider {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn list_models(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["m".into()])
+        }
+        fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_chunk: &dyn Fn(StreamChunk),
+        ) -> Result<(), String> {
+            // Emit one chunk then linger — gives the test time to queue.
+            on_chunk(StreamChunk::Content("hi".into()));
+            std::thread::sleep(Duration::from_millis(300));
+            on_chunk(StreamChunk::Content("done".into()));
+            Ok(())
+        }
+    }
+
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(SlowProvider), "m".into()));
+    app.chat.as_mut().unwrap().send("first".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(app.chat_busy());
+
+    // Type + hit Enter while busy — should queue, not call send().
+    app.push_char('q');
+    app.handle_enter();
+    assert_eq!(app.pending_queue_len(), 1, "prompt should be queued");
+}
+
+#[test]
+fn second_enter_cancels_and_sends_queued() {
+    struct SlowProvider;
+    impl Provider for SlowProvider {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn list_models(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["m".into()])
+        }
+        fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_chunk: &dyn Fn(StreamChunk),
+        ) -> Result<(), String> {
+            on_chunk(StreamChunk::Content("hi".into()));
+            std::thread::sleep(Duration::from_millis(300));
+            on_chunk(StreamChunk::Content("done".into()));
+            Ok(())
+        }
+    }
+
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(SlowProvider), "m".into()));
+    // First prompt goes through the real input path so it lands as a
+    // User transcript entry.
+    for c in "first".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Queue one prompt.
+    app.push_char('a');
+    app.handle_enter();
+    assert_eq!(app.pending_queue_len(), 1);
+
+    // Press Enter again (empty input) — cancels current gen; the queued
+    // prompt should auto-send as soon as Cancelled lands.
+    app.handle_enter();
+    std::thread::sleep(Duration::from_millis(150));
+    app.poll_chat(); // drain Cancelled, which should trigger pop+send
+    std::thread::sleep(Duration::from_millis(400));
+    app.poll_chat(); // let second send finish
+
+    assert_eq!(app.pending_queue_len(), 0, "queue drained");
+    // Two User entries: original + queued.
+    let users = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e.role, Role::User))
+        .count();
+    assert_eq!(users, 2, "queued prompt became a real user entry");
+}
+
+#[test]
+fn esc_cancels_in_flight_generation() {
+    struct SlowProvider;
+    impl Provider for SlowProvider {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn list_models(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["m".into()])
+        }
+        fn chat(
+            &self,
+            _model: &str,
+            _messages: &[Message],
+            _tools: &[ToolSpec],
+            on_chunk: &dyn Fn(StreamChunk),
+        ) -> Result<(), String> {
+            on_chunk(StreamChunk::Content("hi".into()));
+            std::thread::sleep(Duration::from_millis(300));
+            on_chunk(StreamChunk::Content("done".into()));
+            Ok(())
+        }
+    }
+
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(SlowProvider), "m".into()));
+    app.chat.as_mut().unwrap().send("first".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(50));
+
+    // Esc while busy → cancel, NOT quit.
+    let should_quit = app.esc();
+    assert!(!should_quit, "esc should cancel, not quit");
+
+    // Poll until Cancelled arrives.
+    std::thread::sleep(Duration::from_millis(400));
+    app.poll_chat();
+    let cancelled = app
+        .transcript
+        .iter()
+        .any(|e| matches!(e.role, Role::Tool) && e.text.contains("cancelled"));
+    assert!(cancelled, "transcript should show a cancelled marker");
+}

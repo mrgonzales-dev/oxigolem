@@ -142,7 +142,10 @@ pub fn draw(
                 // other non-tool Tool entries land here too — they have
                 // `text` prefixed with a marker so the header reads as
                 // an error line, not a fake `bash` call.
-                if entry.outcome.is_none() && entry.text.starts_with("chat error:") {
+                if entry.outcome.is_none()
+                    && (entry.text.starts_with("chat error:")
+                        || entry.text.starts_with("chat cancelled"))
+                {
                     for l in entry.text.lines() {
                         lines.push(Line::from(vec![
                             Span::styled(

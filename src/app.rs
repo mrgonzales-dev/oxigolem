@@ -71,6 +71,11 @@ pub struct App {
     /// Tick when the last generation finished — drives the shimmer→dim
     /// fade so thinking text eases out instead of snapping.
     pub gen_done_tick: Option<u64>,
+    /// Prompts submitted while a generation was in flight. They sit
+    /// above the input as "waiting" and auto-send when the current
+    /// generation ends (Done) or is interrupted (Cancelled / Enter
+    /// with an empty input).
+    pub pending_queue: Vec<String>,
 }
 
 impl App {
@@ -90,6 +95,7 @@ impl App {
             tick: 0,
             scroll_back: None,
             gen_done_tick: None,
+            pending_queue: Vec::new(),
         }
     }
 
@@ -279,22 +285,19 @@ impl App {
         }
     }
 
-    /// Send input to the connected model. Called on Enter in Agent view.
-    pub fn send_chat(&mut self) {
-        if self.chat.is_none() {
-            self.toast = Some("No provider connected — Ctrl+P to connect".to_string());
-            return;
-        }
-        if self.chat.as_ref().unwrap().is_busy() {
-            self.toast = Some("Generation in progress…".to_string());
-            return;
-        }
-        let text = self.input_expanded();
-        self.parts.clear();
-        let text = text.trim().to_string();
-        if text.is_empty() {
-            return;
-        }
+    /// Number of prompts sitting in the pending queue.
+    pub fn pending_queue_len(&self) -> usize {
+        self.pending_queue.len()
+    }
+
+    /// Read queued prompts for the input-area "waiting" display.
+    pub fn pending_queue(&self) -> &[String] {
+        &self.pending_queue
+    }
+
+    /// Send a prompt straight to the engine (no queueing). Pushes the
+    /// User transcript entry and starts the generation.
+    fn dispatch_chat(&mut self, text: String) {
         self.transcript.push(TranscriptEntry {
             role: Role::User,
             text: text.clone(),
@@ -308,10 +311,59 @@ impl App {
         }
     }
 
+    /// Pop the front of the pending queue and send it, if anything is
+    /// waiting. Called after a generation ends so queued prompts fire
+    /// back-to-back.
+    fn send_next_queued(&mut self) {
+        if self.chat.is_none() || self.chat.as_ref().unwrap().is_busy() {
+            return;
+        }
+        if self.pending_queue.is_empty() {
+            return;
+        }
+        let text = self.pending_queue.remove(0);
+        self.dispatch_chat(text);
+    }
+
+    /// Send input to the connected model. Called on Enter in Agent view.
+    /// While a generation is running: typed text queues (shown above
+    /// the input as waiting); Enter on an empty input cancels the
+    /// generation so the queued prompt can go next.
+    pub fn send_chat(&mut self) {
+        if self.chat.is_none() {
+            self.toast = Some("No provider connected — Ctrl+P to connect".to_string());
+            return;
+        }
+        let text = self.input_expanded();
+        let text = text.trim().to_string();
+
+        if self.chat.as_ref().unwrap().is_busy() {
+            if text.is_empty() {
+                // Enter on empty input = interrupt; any queued prompt
+                // fires when the Cancelled event lands.
+                if let Some(c) = self.chat.as_mut() {
+                    c.cancel();
+                }
+                self.toast = Some("cancelling…".to_string());
+                return;
+            }
+            self.parts.clear();
+            self.pending_queue.push(text);
+            return;
+        }
+
+        self.parts.clear();
+        if text.is_empty() {
+            return;
+        }
+        self.dispatch_chat(text);
+    }
+
     /// Drain chat events from the background thread. Called every loop tick.
     pub fn poll_chat(&mut self) {
         let Some(engine) = &mut self.chat else { return };
         let events = engine.poll();
+        let mut ended = false;
         for ev in events {
             match ev {
                 ChatEvent::Thinking(t) => {
@@ -366,6 +418,20 @@ impl App {
                         }),
                     }
                 }
+                ChatEvent::Cancelled => {
+                    // Push a small "cancelled" marker so the transcript
+                    // shows where the reply was cut off. Partial text
+                    // stays visible; the user's question stays in history
+                    // so they can ask again without losing context.
+                    self.transcript.push(TranscriptEntry {
+                        role: Role::Tool,
+                        text: "chat cancelled".to_string(),
+                        outcome: None,
+                        expanded: false,
+                    });
+                    self.gen_done_tick = Some(self.tick);
+                    ended = true;
+                }
                 ChatEvent::Done(msgs) => {
                     engine.record_appended(msgs);
                     // Don't re-stamp — the thinking→reply transition
@@ -374,6 +440,7 @@ impl App {
                     if self.gen_done_tick.is_none() {
                         self.gen_done_tick = Some(self.tick);
                     }
+                    ended = true;
                 }
                 ChatEvent::Error(e) => {
                     while let Some(last) = self.transcript.last()
@@ -389,8 +456,12 @@ impl App {
                         expanded: false,
                     });
                     self.toast = Some("chat failed — see transcript".to_string());
+                    ended = true;
                 }
             }
+        }
+        if ended {
+            self.send_next_queued();
         }
     }
 
@@ -408,6 +479,19 @@ impl App {
             outcome: None,
             expanded: false,
         });
+    }
+
+    /// Esc pressed. Cancels an in-flight generation if one is running;
+    /// otherwise returns true so the caller can quit.
+    pub fn esc(&mut self) -> bool {
+        if self.chat.as_ref().is_some_and(|c| c.is_busy()) {
+            if let Some(c) = self.chat.as_mut() {
+                c.cancel();
+            }
+            self.toast = Some("cancelling…".to_string());
+            return false;
+        }
+        true
     }
 
     /// Toggle the most recent tool block between collapsed and expanded.

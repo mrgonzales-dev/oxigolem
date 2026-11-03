@@ -1,5 +1,8 @@
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 use std::thread;
 
 use super::{
@@ -68,6 +71,9 @@ pub enum ChatEvent {
     /// Generation finished. Carries every message appended this round
     /// (assistant replies + tool results) so history stays complete.
     Done(Vec<Message>),
+    /// User pressed Esc during a generation — the partial reply stays
+    /// in the transcript but is not committed to history.
+    Cancelled,
     Error(String),
 }
 
@@ -80,6 +86,10 @@ pub struct ChatEngine {
     model: String,
     history: Vec<Message>,
     rx: Option<Receiver<ChatEvent>>,
+    /// Cancel flag shared with the worker thread — set by `cancel()` on
+    /// Esc; the loop checks it between iterations and inside the chunk
+    /// callback so the stream aborts on the next chunk.
+    cancel: Arc<AtomicBool>,
     /// Shared with the user's Output-view terminal — one shell, one cwd.
     shell: Shell,
 }
@@ -91,6 +101,7 @@ impl ChatEngine {
             model,
             history: Vec::new(),
             rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
             shell: Shell::new(),
         }
     }
@@ -103,6 +114,7 @@ impl ChatEngine {
             model,
             history: Vec::new(),
             rx: None,
+            cancel: Arc::new(AtomicBool::new(false)),
             shell,
         }
     }
@@ -123,10 +135,12 @@ impl ChatEngine {
 
         let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
         self.rx = Some(rx);
+        self.cancel.store(false, Ordering::Relaxed);
 
         let provider = Arc::clone(&self.provider);
         let model = self.model.clone();
         let shell = self.shell.clone();
+        let cancel = Arc::clone(&self.cancel);
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
         msgs.push(Message::system(&system_prompt()));
         msgs.extend(self.history.iter().cloned());
@@ -136,20 +150,36 @@ impl ChatEngine {
             let tool_specs = tools::specs();
             let result = (|| -> Result<(), String> {
                 for _ in 0..MAX_ITERATIONS {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("__cancelled__".to_string());
+                    }
                     let text = std::cell::RefCell::new(String::new());
                     let calls = std::cell::RefCell::new(Vec::<ToolCall>::new());
-                    provider.chat(&model, &msgs, &tool_specs, &|chunk| match chunk {
-                        StreamChunk::Content(t) => {
-                            text.borrow_mut().push_str(&t);
-                            let _ = tx.send(ChatEvent::Token(t));
+                    let cancel_inner = Arc::clone(&cancel);
+                    provider.chat(&model, &msgs, &tool_specs, &|chunk| {
+                        // Abort as soon as the next chunk arrives after
+                        // Esc — the underlying HTTP read can't be
+                        // interrupted mid-recv, so this is the earliest
+                        // we can bail.
+                        if cancel_inner.load(Ordering::Relaxed) {
+                            return;
                         }
-                        StreamChunk::Thinking(t) => {
-                            let _ = tx.send(ChatEvent::Thinking(t));
-                        }
-                        StreamChunk::ToolCall { name, arguments } => {
-                            calls.borrow_mut().push(ToolCall { name, arguments });
+                        match chunk {
+                            StreamChunk::Content(t) => {
+                                text.borrow_mut().push_str(&t);
+                                let _ = tx.send(ChatEvent::Token(t));
+                            }
+                            StreamChunk::Thinking(t) => {
+                                let _ = tx.send(ChatEvent::Thinking(t));
+                            }
+                            StreamChunk::ToolCall { name, arguments } => {
+                                calls.borrow_mut().push(ToolCall { name, arguments });
+                            }
                         }
                     })?;
+                    if cancel.load(Ordering::Relaxed) {
+                        return Err("__cancelled__".to_string());
+                    }
                     let text = text.into_inner();
                     let calls = calls.into_inner();
 
@@ -187,6 +217,9 @@ impl ChatEngine {
                 Ok(()) => {
                     let _ = tx.send(ChatEvent::Done(appended));
                 }
+                Err(e) if e == "__cancelled__" => {
+                    let _ = tx.send(ChatEvent::Cancelled);
+                }
                 Err(e) => {
                     let _ = tx.send(ChatEvent::Error(e));
                 }
@@ -196,21 +229,33 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Cancel an in-flight generation. The worker thread observes the
+    /// flag at the next chunk or loop boundary and emits `Cancelled`.
+    /// The user's message stays in history — the model still saw it.
+    pub fn cancel(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+    }
+
     /// Drain all pending events. Called every event-loop iteration.
     pub fn poll(&mut self) -> Vec<ChatEvent> {
         let Some(rx) = &self.rx else { return Vec::new() };
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            let terminal = matches!(ev, ChatEvent::Done(_) | ChatEvent::Error(_));
+            let terminal = matches!(
+                ev,
+                ChatEvent::Done(_) | ChatEvent::Error(_) | ChatEvent::Cancelled
+            );
             events.push(ev);
             if terminal {
                 break;
             }
         }
-        if events
-            .iter()
-            .any(|e| matches!(e, ChatEvent::Done(_) | ChatEvent::Error(_)))
-        {
+        if events.iter().any(|e| {
+            matches!(
+                e,
+                ChatEvent::Done(_) | ChatEvent::Error(_) | ChatEvent::Cancelled
+            )
+        }) {
             self.rx = None;
         }
         events

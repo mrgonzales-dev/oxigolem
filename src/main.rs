@@ -78,7 +78,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         app.dismiss_toast();
                         app.toggle_view();
                     }
-                    KeyCode::Esc => return Ok(()),
+                    KeyCode::Esc => {
+                        if app.esc() {
+                            return Ok(());
+                        }
+                    }
                     KeyCode::Enter => {
                         app.dismiss_toast();
                         app.handle_enter();
@@ -107,7 +111,11 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Min(0),    // body
-            Constraint::Length(ui::input::height_for(&app.input_display(), area.width)), // input (grows downward)
+            Constraint::Length(ui::input::height_for(
+                &app.input_display(),
+                app.pending_queue(),
+                area.width,
+            )), // input (grows downward, queue rows on top)
             Constraint::Length(2), // footer status bar
         ])
         .split(area);
@@ -125,7 +133,13 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }
 
-    ui::input::draw(f, root[1], &app.input_display(), app.tick);
+    ui::input::draw(
+        f,
+        root[1],
+        &app.input_display(),
+        app.pending_queue(),
+        app.tick,
+    );
     ui::header::draw(f, root[2], app.view, app.connected.as_ref());
 
     if let Some(m) = &app.modal {
