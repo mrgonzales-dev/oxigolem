@@ -1,6 +1,8 @@
+use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use super::Provider;
+use crate::chat::Message;
 
 pub struct Ollama {
     host: String,
@@ -50,5 +52,57 @@ impl Provider for Ollama {
         } else {
             Ok(models)
         }
+    }
+
+    fn chat(
+        &self,
+        model: &str,
+        messages: &[Message],
+        on_token: &dyn Fn(String),
+    ) -> Result<(), String> {
+        let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
+
+        let messages_json: Vec<serde_json::Value> = messages
+            .iter()
+            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .collect();
+
+        let body = serde_json::json!({
+            "model": model,
+            "messages": messages_json,
+            "stream": true,
+        });
+
+        let response = ureq::post(&url)
+            .timeout(Duration::from_secs(120))
+            .send_json(body)
+            .map_err(|e| format!("chat request failed: {e}"))?;
+
+        let reader = BufReader::new(response.into_reader());
+        let mut got_any = false;
+
+        for line in reader.lines() {
+            let line = line.map_err(|e| format!("stream read error: {e}"))?;
+            if line.is_empty() {
+                continue;
+            }
+            let v: serde_json::Value =
+                serde_json::from_str(&line).map_err(|e| format!("bad NDJSON line: {e}"))?;
+
+            if v["done"].as_bool() == Some(true) {
+                break;
+            }
+            if let Some(content) = v["message"]["content"].as_str()
+                && !content.is_empty()
+            {
+                got_any = true;
+                on_token(content.to_string());
+            }
+        }
+
+        if !got_any {
+            return Err("empty response from model".to_string());
+        }
+        Ok(())
     }
 }

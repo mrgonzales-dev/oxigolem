@@ -1,10 +1,5 @@
-mod app;
-mod modal;
-mod provider;
-mod theme;
-mod ui;
-
-use app::{App, View};
+use oxigolem::app::{App, View};
+use oxigolem::ui;
 use crossterm::{
     event::{
         self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
@@ -19,6 +14,7 @@ use ratatui::{
     Terminal,
 };
 use std::io;
+use std::time::Duration;
 
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
@@ -40,39 +36,43 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     loop {
         terminal.draw(|f| draw(f, &app))?;
 
-        match event::read()? {
-            Event::Paste(text) if app.modal.is_none() => app.push_paste(text),
-            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    app.open_palette()
-                }
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    if app.ctrl_c() {
-                        return Ok(());
+        app.poll_chat();
+
+        if event::poll(Duration::from_millis(50))? {
+            match event::read()? {
+                Event::Paste(text) if app.modal.is_none() => app.push_paste(text),
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.open_palette()
                     }
-                }
-                code if app.modal.is_some() => app.modal_key(code),
-                KeyCode::BackTab => {
-                    app.dismiss_toast();
-                    app.toggle_view();
-                }
-                KeyCode::Esc => return Ok(()),
-                KeyCode::Enter => {
-                    app.dismiss_toast();
-                    app.run_command();
-                }
-                KeyCode::Backspace => {
-                    app.dismiss_toast();
-                    app.pop_input();
-                }
-                KeyCode::Char('q') if app.is_input_empty() => return Ok(()),
-                KeyCode::Char(c) => {
-                    app.dismiss_toast();
-                    app.push_char(c);
-                }
+                    KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.ctrl_c() {
+                            return Ok(());
+                        }
+                    }
+                    code if app.modal.is_some() => app.modal_key(code),
+                    KeyCode::BackTab => {
+                        app.dismiss_toast();
+                        app.toggle_view();
+                    }
+                    KeyCode::Esc => return Ok(()),
+                    KeyCode::Enter => {
+                        app.dismiss_toast();
+                        app.handle_enter();
+                    }
+                    KeyCode::Backspace => {
+                        app.dismiss_toast();
+                        app.pop_input();
+                    }
+                    KeyCode::Char('q') if app.is_input_empty() => return Ok(()),
+                    KeyCode::Char(c) => {
+                        app.dismiss_toast();
+                        app.push_char(c);
+                    }
+                    _ => {}
+                },
                 _ => {}
-            },
-            _ => {}
+            }
         }
     }
 }

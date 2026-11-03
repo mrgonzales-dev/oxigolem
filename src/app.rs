@@ -1,8 +1,10 @@
 use std::process::Command;
+use std::sync::Arc;
 
 use crossterm::event::KeyCode;
 
 use crate::{
+    chat::{ChatEngine, ChatEvent},
     modal::{Connection, Kind, Modal},
     provider::{self, Provider},
 };
@@ -42,7 +44,8 @@ pub struct App {
     pub connected: Option<Connection>,
     pub toast: Option<String>,
     pub transcript: Vec<TranscriptEntry>,
-    providers: Vec<Box<dyn Provider>>,
+    providers: Vec<Arc<dyn Provider>>,
+    pub chat: Option<ChatEngine>,
 }
 
 impl App {
@@ -57,6 +60,7 @@ impl App {
             toast: None,
             transcript: Vec::new(),
             providers: provider::registry(),
+            chat: None,
         }
     }
 
@@ -139,10 +143,12 @@ impl App {
                 })
             }
             Kind::Models { provider, .. } => {
+                let p = Arc::clone(&self.providers[provider]);
                 self.connected = Some(Connection {
                     provider: self.providers[provider].name(),
-                    model: choice,
+                    model: choice.clone(),
                 });
+                self.chat = Some(ChatEngine::new(p, choice));
                 None
             }
             Kind::Message(_) => None,
@@ -235,6 +241,79 @@ impl App {
                 }
             }
             Err(e) => self.term_lines.push(format!("spawn failed: {e}")),
+        }
+    }
+
+    /// Send input to the connected model. Called on Enter in Agent view.
+    pub fn send_chat(&mut self) {
+        if self.chat.is_none() {
+            self.toast = Some("No provider connected — Ctrl+P to connect".to_string());
+            return;
+        }
+        if self.chat.as_ref().unwrap().is_busy() {
+            self.toast = Some("Generation in progress…".to_string());
+            return;
+        }
+        let text = self.input_expanded();
+        self.parts.clear();
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            return;
+        }
+        self.transcript.push(TranscriptEntry {
+            role: Role::User,
+            text: text.clone(),
+        });
+        self.transcript.push(TranscriptEntry {
+            role: Role::Golem,
+            text: String::new(),
+        });
+        if let Err(e) = self.chat.as_mut().unwrap().send(text) {
+            self.toast = Some(e);
+            self.transcript.pop();
+        }
+    }
+
+    /// Drain chat events from the background thread. Called every loop tick.
+    pub fn poll_chat(&mut self) {
+        let Some(engine) = &mut self.chat else { return };
+        let events = engine.poll();
+        for ev in events {
+            match ev {
+                ChatEvent::Token(token) => {
+                    if let Some(last) = self.transcript.last_mut()
+                        && matches!(last.role, Role::Golem)
+                    {
+                        last.text.push_str(&token);
+                    }
+                }
+                ChatEvent::Done => {
+                    let text = self
+                        .transcript
+                        .last()
+                        .filter(|e| matches!(e.role, Role::Golem))
+                        .map(|e| e.text.clone())
+                        .unwrap_or_default();
+                    engine.record_assistant(text);
+                }
+                ChatEvent::Error(e) => {
+                    if let Some(last) = self.transcript.last_mut()
+                        && matches!(last.role, Role::Golem)
+                        && last.text.is_empty()
+                    {
+                        self.transcript.pop();
+                    }
+                    self.toast = Some(format!("chat error: {e}"));
+                }
+            }
+        }
+    }
+
+    /// Route Enter based on the current view.
+    pub fn handle_enter(&mut self) {
+        match self.view {
+            View::Agent => self.send_chat(),
+            View::Output => self.run_command(),
         }
     }
 }
