@@ -1063,3 +1063,69 @@ fn fenced_mode_passes_plain_text_unchanged() {
     }
     panic!("engine never finished");
 }
+
+#[test]
+fn parallel_batch_preserves_result_order() {
+    // Two read-only calls in one turn — both execute, and ToolResult
+    // order must match ToolCall order so history lines up.
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(
+            vec![
+                vec![
+                    StreamChunk::ToolCall {
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo first"}),
+                    },
+                    StreamChunk::ToolCall {
+                        name: "bash".into(),
+                        arguments: serde_json::json!({"command": "echo second"}),
+                    },
+                ],
+                vec![StreamChunk::Content("done".into())],
+            ]
+            .into(),
+        ),
+    });
+    let mut engine = ChatEngine::new(provider, "m".into());
+    engine.send("go".into()).unwrap();
+    let mut results: Vec<String> = Vec::new();
+    for _ in 0..300 {
+        for ev in engine.poll() {
+            match ev {
+                ChatEvent::ToolResult { outcome, .. } => {
+                    results.push(outcome.result.stdout.trim().to_string());
+                }
+                ChatEvent::Done(_) => {
+                    assert_eq!(results, vec!["first", "second"]);
+                    return;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("never done");
+}
+
+#[test]
+fn batchable_allowlist_filters_mutations() {
+    use oxigolem::agent::tools::batchable;
+    assert!(batchable("ls -la"));
+    assert!(batchable("cat foo.txt | grep bar"));
+    assert!(batchable("rg -n pattern src/"));
+    assert!(batchable("git status"));
+    assert!(batchable("git log --oneline -10"));
+    assert!(batchable("cargo check"));
+    assert!(batchable("find . -name '*.rs'"));
+    assert!(batchable("sed -n '1,10p' file"));
+    assert!(!batchable("rm -rf x"));
+    assert!(!batchable("echo hi > f.txt"));
+    assert!(!batchable("ls && rm x"));
+    assert!(!batchable("cat $(evil)"));
+    assert!(!batchable("git push"));
+    assert!(!batchable("git checkout ."));
+    assert!(!batchable("cargo build"));
+    assert!(!batchable("sed -i 's/a/b/' f"));
+    assert!(!batchable("sleep 1"));
+    assert!(!batchable("FOO=1 ls"));
+}

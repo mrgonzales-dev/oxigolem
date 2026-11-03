@@ -188,6 +188,76 @@ fn jobs_dir() -> Option<String> {
     jobs_dir_path().map(|p| p.to_string_lossy().into_owned())
 }
 
+/// Read-only allowlist for the parallel-batch path. A command is
+/// batchable only when EVERY pipeline stage is one of these verbs and
+/// the whole string carries no redirection/subshell metachars. The
+/// first word of each `|`-separated stage is checked; flags are free.
+const BATCHABLE_VERBS: &[&str] = &[
+    "grep", "rg", "cat", "ls", "sed", "head", "tail", "wc", "find", "git", "cargo", "pwd",
+    "echo", "printf", "env", "uname", "df", "du", "free", "ps", "date", "which", "whoami",
+    "hostname", "file", "stat", "tree",
+];
+
+/// Git subcommands that don't mutate the repo or the index.
+const BATCHABLE_GIT: &[&str] = &["status", "log", "diff", "grep", "show", "blame", "ls-files",
+    "branch", "tag", "rev-parse", "describe", "shortlog", "stash", "remote"];
+
+/// Cargo subcommands that only read/build — `check`/`test`/`metadata`
+/// write target/ but never touch source; the parallelism is safe.
+const BATCHABLE_CARGO: &[&str] = &["check", "test", "metadata", "tree", "search", "version",
+    "pkgid", "verify-project"];
+
+/// Metachars that make a command unsafe to batch: redirection, command
+/// substitution, backgrounding, sequencing. `|` is handled separately
+/// by splitting into stages. `sed` is allowlisted but only with `-n`
+/// (in-place `-i` would mutate) — checked below.
+const UNSAFE_METACHARS: &[char] = &['>', '<', '&', ';', '$', '`', '\n'];
+
+/// True when `cmd` is safe to run concurrently with other read-only
+/// commands on the same shell cwd. Deliberately conservative — anything
+/// unrecognized falls back to sequential execution.
+pub fn batchable(cmd: &str) -> bool {
+    if cmd.chars().any(|c| UNSAFE_METACHARS.contains(&c)) {
+        return false;
+    }
+    for stage in cmd.split('|') {
+        let mut words = stage.split_whitespace();
+        let Some(verb) = words.next() else { return false };
+        // Strip path prefixes ("/bin/ls" → "ls") and env assignments
+        // ("FOO=1 ls" handled by checking for '=' before the verb).
+        if verb.contains('=') {
+            return false;
+        }
+        let verb = verb.rsplit('/').next().unwrap_or(verb);
+        if !BATCHABLE_VERBS.contains(&verb) {
+            return false;
+        }
+        match verb {
+            "sed" => {
+                // Only `sed -n` (print) — bare `sed s/…/` streams edits
+                // to stdout so it's also safe, but `-i` writes in place.
+                if stage.split_whitespace().any(|w| w == "-i" || w.starts_with("-i")) {
+                    return false;
+                }
+            }
+            "git" => {
+                let sub = words.next().unwrap_or("");
+                if !BATCHABLE_GIT.contains(&sub) {
+                    return false;
+                }
+            }
+            "cargo" => {
+                let sub = words.next().unwrap_or("");
+                if !BATCHABLE_CARGO.contains(&sub) {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    true
+}
+
 /// Every bash call — foreground or `run_in_background` — spawns through
 /// `Shell::spawn_bg` so the process lives in the shared registry while
 /// it runs (a shell tab appears live). Foreground shells are marked

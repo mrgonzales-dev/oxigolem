@@ -295,15 +295,11 @@ impl ChatEngine {
                     if calls.is_empty() {
                         return Ok(());
                     }
-                    for call in calls {
-                        let _ = tx.send(ChatEvent::ToolCall {
-                            name: call.name.clone(),
-                            args: call.arguments.clone(),
-                        });
+                    let run_one = |call: &ToolCall| -> ToolOutcome {
                         // catch_unwind: a tool panic must not take the
                         // agent thread down — synthesize an error
                         // outcome so the loop keeps going.
-                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                             tools::execute(&shell, &shells, &demote, &call.name, &call.arguments)
                         }))
                         .unwrap_or_else(|_| tools::ToolOutcome {
@@ -321,7 +317,56 @@ impl ChatEngine {
                             },
                             spilled: None,
                             demoted: false,
+                        })
+                    };
+
+                    // Parallel batch: 2+ bash calls that are all
+                    // provably read-only run on scoped threads (cap
+                    // 4). Anything mutating or unrecognized falls back
+                    // to sequential — safety beats speed.
+                    let all_batchable = calls.len() > 1
+                        && calls.iter().all(|c| {
+                            c.name == "bash"
+                                && tools::batchable(c.arguments["command"].as_str().unwrap_or(""))
                         });
+                    let outcomes: Vec<ToolOutcome> = if all_batchable {
+                        for call in &calls {
+                            let _ = tx.send(ChatEvent::ToolCall {
+                                name: call.name.clone(),
+                                args: call.arguments.clone(),
+                            });
+                        }
+                        let mut results: Vec<Option<ToolOutcome>> =
+                            (0..calls.len()).map(|_| None).collect();
+                        std::thread::scope(|s| {
+                            let mut slots = results.iter_mut();
+                            for chunk in calls.chunks(4) {
+                                let mut handles = Vec::new();
+                                for call in chunk {
+                                    let slot = slots.next().unwrap();
+                                    handles.push(s.spawn(move || {
+                                        *slot = Some(run_one(call));
+                                    }));
+                                }
+                                for h in handles {
+                                    let _ = h.join();
+                                }
+                            }
+                        });
+                        results.into_iter().map(|r| r.unwrap()).collect()
+                    } else {
+                        calls
+                            .iter()
+                            .map(|call| {
+                                let _ = tx.send(ChatEvent::ToolCall {
+                                    name: call.name.clone(),
+                                    args: call.arguments.clone(),
+                                });
+                                run_one(call)
+                            })
+                            .collect()
+                    };
+                    for (call, outcome) in calls.iter().zip(outcomes) {
                         let text = outcome.to_tool_message();
                         let _ = tx.send(ChatEvent::ToolResult {
                             name: call.name.clone(),
