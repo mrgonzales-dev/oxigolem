@@ -95,7 +95,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }
 
-    ui::input::draw(f, root[1], &app.input_display());
+    ui::input::draw(f, root[1], &app.input_display(), app.tick);
     ui::header::draw(f, root[2], app.view, app.connected.as_ref());
 
     if let Some(m) = &app.modal {

@@ -40,14 +40,19 @@ fn wrapped_tail(input: &str, usable: usize, max: usize) -> Vec<String> {
     lines[start..].to_vec()
 }
 
-pub fn draw(f: &mut Frame, area: Rect, input: &str) {
+pub fn draw(f: &mut Frame, area: Rect, input: &str, tick: u64) {
     let content_height = area.height.saturating_sub(1) as usize; // minus top border
     let usable = area.width.saturating_sub(3) as usize;
+    // Blink the cursor at ~10 ticks per on/off cycle (~500ms at 50ms/tick).
+    let cursor_on = tick % 20 < 12;
+    let cursor = if cursor_on { "█" } else { " " };
+    let cursor_style = Style::default().fg(ORANGE);
 
     let content = if input.is_empty() {
         vec![Line::from(vec![
             Span::styled("❯ ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
-            Span::styled("type a command…", Style::default().fg(FAINT)),
+            Span::styled(cursor, cursor_style),
+            Span::styled(" type a command…", Style::default().fg(FAINT)),
         ])]
     } else {
         let mut out = Vec::new();
@@ -68,7 +73,7 @@ pub fn draw(f: &mut Frame, area: Rect, input: &str) {
             spans.push(Span::styled(chunk.clone(), Style::default().fg(TEXT)));
             // cursor block on very last visible chunk
             if i == tail.len() - 1 {
-                spans.push(Span::styled("█", Style::default().fg(ORANGE)));
+                spans.push(Span::styled(cursor, cursor_style));
             }
             out.push(Line::from(spans));
         }
