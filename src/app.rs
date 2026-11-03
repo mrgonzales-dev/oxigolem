@@ -3,7 +3,10 @@ use std::sync::Arc;
 use crossterm::event::KeyCode;
 
 use crate::{
-    agent::chat::{ChatEngine, ChatEvent},
+    agent::{
+        chat::{ChatEngine, ChatEvent},
+        tools::ToolOutcome,
+    },
     modal::{Connection, Kind, Modal},
     provider::{self, Provider},
     shell::Shell,
@@ -28,6 +31,15 @@ pub enum Role {
 pub struct TranscriptEntry {
     pub role: Role,
     pub text: String,
+    /// Present on `Role::Tool` entries once the call has finished —
+    /// carries the structured `ShellResult` so the UI can render a
+    /// cursor-cli-style block (command, stdout, stderr, exit code,
+    /// duration). `None` while the call is still streaming or on the
+    /// `$ cmd` placeholder line.
+    pub outcome: Option<ToolOutcome>,
+    /// Whether a long tool block is expanded. `false` collapses output
+    /// past a small line budget into a `… (N lines hidden)` row.
+    pub expanded: bool,
 }
 
 /// One segment of the input buffer: typed text or a paste chip.
@@ -286,6 +298,8 @@ impl App {
         self.transcript.push(TranscriptEntry {
             role: Role::User,
             text: text.clone(),
+            outcome: None,
+            expanded: false,
         });
         self.gen_done_tick = None;
         if let Err(e) = self.chat.as_mut().unwrap().send(text) {
@@ -312,26 +326,45 @@ impl App {
                     Self::append_or_push(&mut self.transcript, Role::Golem, token);
                 }
                 ChatEvent::ToolCall { name, args } => {
-                    // bash calls render as `⎿ $ <command>` — the same
-                    // shape as a line the user typed themselves.
-                    let text = if name == "bash" {
-                        match args["command"].as_str() {
-                            Some(c) => format!("$ {c}"),
-                            None => format!("$ bash (bad args: {args})"),
-                        }
+                    // Push a header entry now so the block has somewhere
+                    // to live while the command runs. The follow-up
+                    // `ToolResult` attaches the structured outcome to
+                    // this same entry.
+                    let command = if name == "bash" {
+                        args["command"].as_str().unwrap_or("").to_string()
                     } else {
-                        format!("{name} {args}")
+                        args.to_string()
                     };
                     self.transcript.push(TranscriptEntry {
                         role: Role::Tool,
-                        text,
+                        text: command,
+                        outcome: None,
+                        expanded: false,
                     });
                 }
-                ChatEvent::ToolResult { output, .. } => {
-                    self.transcript.push(TranscriptEntry {
-                        role: Role::Tool,
-                        text: output,
-                    });
+                ChatEvent::ToolResult { name, outcome } => {
+                    // Attach the outcome to the most recent in-flight
+                    // tool entry; if we somehow missed the ToolCall
+                    // (shouldn't happen), push a fresh one.
+                    let entry = self
+                        .transcript
+                        .iter_mut()
+                        .rev()
+                        .find(|e| matches!(e.role, Role::Tool) && e.outcome.is_none());
+                    match entry {
+                        Some(e) => {
+                            if e.text.is_empty() {
+                                e.text = outcome.command.clone();
+                            }
+                            e.outcome = Some(outcome);
+                        }
+                        None => self.transcript.push(TranscriptEntry {
+                            role: Role::Tool,
+                            text: format!("[{name}]"),
+                            outcome: Some(outcome),
+                            expanded: false,
+                        }),
+                    }
                 }
                 ChatEvent::Done(msgs) => {
                     engine.record_appended(msgs);
@@ -352,6 +385,8 @@ impl App {
                     self.transcript.push(TranscriptEntry {
                         role: Role::Tool,
                         text: format!("chat error: {e}"),
+                        outcome: None,
+                        expanded: false,
                     });
                     self.toast = Some("chat failed — see transcript".to_string());
                 }
@@ -367,7 +402,25 @@ impl App {
             last.text.push_str(&text);
             return;
         }
-        transcript.push(TranscriptEntry { role, text });
+        transcript.push(TranscriptEntry {
+            role,
+            text,
+            outcome: None,
+            expanded: false,
+        });
+    }
+
+    /// Toggle the most recent tool block between collapsed and expanded.
+    /// Used by `Ctrl+E` in the Agent view.
+    pub fn toggle_tool_expand(&mut self) {
+        if let Some(e) = self
+            .transcript
+            .iter_mut()
+            .rev()
+            .find(|e| matches!(e.role, Role::Tool) && e.outcome.is_some())
+        {
+            e.expanded = !e.expanded;
+        }
     }
 
     /// Route Enter based on the current view.

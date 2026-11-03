@@ -130,14 +130,123 @@ pub fn draw(
                 lines.push(Line::default());
             }
             Role::Tool => {
-                // "  ⎿ text" — tool output indented, dimmed, like Claude Code.
-                for l in entry.text.lines() {
+                // Cursor-cli style: a header `● bash · $ cmd`, an
+                // indented body of stdout + `! ` stderr lines, and an
+                // `✓ exit 0 · duration` footer. Output past
+                // COLLAPSE_LINES collapses into a `… (N lines hidden)`
+                // row until the user toggles with Ctrl+E.
+                const COLLAPSE_LINES: usize = 8;
+
+                // In-flight placeholder (ToolCall arrived, ToolResult
+                // hasn't yet) renders the header alone. Chat errors and
+                // other non-tool Tool entries land here too — they have
+                // `text` prefixed with a marker so the header reads as
+                // an error line, not a fake `bash` call.
+                if entry.outcome.is_none() && entry.text.starts_with("chat error:") {
+                    for l in entry.text.lines() {
+                        lines.push(Line::from(vec![
+                            Span::styled(
+                                format!("{pad}  ⎿ "),
+                                Style::default().fg(ORANGE_DIM),
+                            ),
+                            Span::styled(l.to_string(), Style::default().fg(FAINT)),
+                        ]));
+                    }
+                    lines.push(Line::default());
+                    continue;
+                }
+                // Header — `● bash · $ cmd`. Falls back to the raw text
+                // for non-bash tools (they stash args JSON in `text`).
+                let (tool_name, cmd) = match entry.outcome.as_ref() {
+                    Some(o) => ("bash".to_string(), o.command.clone()),
+                    None => ("bash".to_string(), entry.text.clone()),
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{pad}● "),
+                        Style::default()
+                            .fg(ORANGE)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        tool_name,
+                        Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!(" · $ {cmd}"),
+                        Style::default().fg(FAINT),
+                    ),
+                ]));
+
+                // Body — only when we have an outcome; otherwise the call
+                // is still in flight and the header alone shows intent.
+                if let Some(out) = &entry.outcome {
+                    let mut body: Vec<String> = Vec::new();
+                    if let Some(err) = &out.result.error {
+                        body.push(err.clone());
+                    } else if out.result.timed_out {
+                        body.push(format!(
+                            "! timed out after {}s",
+                            out.result.duration.as_secs()
+                        ));
+                    } else {
+                        body.extend(out.result.stdout.lines().map(|l| l.to_string()));
+                        body.extend(
+                            out.result
+                                .stderr
+                                .lines()
+                                .map(|l| format!("! {l}")),
+                        );
+                    }
+                    let total = body.len();
+                    let show = if entry.expanded || total <= COLLAPSE_LINES {
+                        &body[..]
+                    } else {
+                        &body[..COLLAPSE_LINES]
+                    };
+                    for l in show {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{pad}  "), Style::default()),
+                            Span::styled(l.clone(), Style::default().fg(FAINT)),
+                        ]));
+                    }
+                    if !entry.expanded && total > COLLAPSE_LINES {
+                        let hidden = total - COLLAPSE_LINES;
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{pad}  "), Style::default()),
+                            Span::styled(
+                                format!("… ({hidden} lines hidden — Ctrl+E to expand)"),
+                                Style::default().fg(ORANGE_DIM),
+                            ),
+                        ]));
+                    }
+
+                    // Footer — `✓ exit 0 · 0.04s` on success, `✗ exit N` on
+                    // nonzero, `✗ timed out` when killed, `✗ <error>` on
+                    // spawn/missing-command failures.
+                    let (mark, summary, color) = if out.result.timed_out {
+                        (
+                            "✗",
+                            format!("timed out after {}s", out.result.duration.as_secs()),
+                            ORANGE_DIM,
+                        )
+                    } else if let Some(e) = &out.result.error {
+                        ("✗", e.clone(), ORANGE_DIM)
+                    } else {
+                        match out.result.code {
+                            Some(0) => ("✓", "exit 0".to_string(), ORANGE_DIM),
+                            Some(c) => ("✗", format!("exit {c}"), ORANGE_DIM),
+                            None => ("✗", "no exit code".to_string(), ORANGE_DIM),
+                        }
+                    };
+                    let secs = out.result.duration.as_secs_f32();
                     lines.push(Line::from(vec![
+                        Span::styled(format!("{pad}  "), Style::default()),
+                        Span::styled(mark.to_string(), Style::default().fg(color)),
                         Span::styled(
-                            format!("{pad}  ⎿ "),
-                            Style::default().fg(ORANGE_DIM),
+                            format!(" {summary} · {secs:.2}s"),
+                            Style::default().fg(FAINT),
                         ),
-                        Span::styled(l.to_string(), Style::default().fg(FAINT)),
                     ]));
                 }
                 lines.push(Line::default());

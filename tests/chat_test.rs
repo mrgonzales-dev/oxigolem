@@ -199,7 +199,7 @@ fn engine_executes_tool_call_and_continues() {
     // Tool call + result events surfaced.
     assert!(events.iter().any(|e| matches!(e, ChatEvent::ToolCall { name, .. } if name == "bash")));
     let result = events.iter().find_map(|e| match e {
-        ChatEvent::ToolResult { output, .. } => Some(output.clone()),
+        ChatEvent::ToolResult { outcome, .. } => Some(outcome.result.stdout.clone()),
         _ => None,
     });
     assert!(
@@ -599,6 +599,8 @@ fn app_thinking_and_reply_are_separate_entries() {
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::User,
         text: "hi".into(),
+        outcome: None,
+        expanded: false,
     });
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();
     std::thread::sleep(Duration::from_millis(150));
@@ -626,6 +628,8 @@ fn app_tool_events_render_as_tool_entries() {
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::User,
         text: "run it".into(),
+        outcome: None,
+        expanded: false,
     });
     app.chat.as_mut().unwrap().send("run it".into()).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -634,11 +638,16 @@ fn app_tool_events_render_as_tool_entries() {
     let roles: Vec<Role> = app.transcript.iter().map(|e| e.role).collect();
     assert_eq!(
         roles,
-        vec![Role::User, Role::Tool, Role::Tool, Role::Golem],
+        vec![Role::User, Role::Tool, Role::Golem],
         "transcript roles: {roles:?}"
     );
-    assert_eq!(app.transcript[1].text, "$ echo hi");
-    assert!(app.transcript[2].text.contains("hi"));
+    assert_eq!(app.transcript[1].text, "echo hi");
+    let out = app.transcript[1]
+        .outcome
+        .as_ref()
+        .expect("tool entry has outcome");
+    assert!(out.result.stdout.contains("hi"));
+    assert_eq!(out.result.code, Some(0));
 }
 
 #[test]
@@ -668,10 +677,14 @@ fn app_chat_error_goes_to_transcript() {
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::User,
         text: "hi".into(),
+        outcome: None,
+        expanded: false,
     });
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::Golem,
         text: String::new(),
+        outcome: None,
+        expanded: false,
     });
     // Manually kick a send so an error is pending.
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();

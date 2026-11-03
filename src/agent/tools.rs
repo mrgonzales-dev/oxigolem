@@ -1,5 +1,4 @@
-use crate::shell::Shell;
-
+use crate::shell::{Shell, ShellResult};
 
 /// One callable tool, described in the Ollama `tools` request format.
 pub struct ToolSpec {
@@ -48,15 +47,58 @@ pub fn to_json(specs: &[ToolSpec]) -> serde_json::Value {
     )
 }
 
-/// Run a tool call and return its output as the tool message content.
-pub fn execute(shell: &Shell, name: &str, args: &serde_json::Value) -> String {
+/// Outcome of a tool call. For `bash` this wraps the `ShellResult`; for
+/// unknown/bad calls it carries a synthesized error so the UI can still
+/// render it like a finished block.
+#[derive(Clone, Debug)]
+pub struct ToolOutcome {
+    /// Command the tool actually ran (for bash, `args.command`).
+    pub command: String,
+    pub result: ShellResult,
+}
+
+impl ToolOutcome {
+    /// Text form for the Ollama `role:"tool"` message — what the model
+    /// sees. Identical to the old flattened `Shell::run` output.
+    pub fn to_tool_message(&self) -> String {
+        self.result.to_text()
+    }
+}
+
+/// Run a tool call and return its structured outcome. Unknown tools or a
+/// missing `command` still produce an outcome — tagged `error` so the UI
+/// can render the failure the same way as a failed exit code.
+pub fn execute(shell: &Shell, name: &str, args: &serde_json::Value) -> ToolOutcome {
     match name {
         "bash" => {
-            let Some(cmd) = args["command"].as_str() else {
-                return "error: bash call missing 'command' argument".to_string();
+            let cmd = args["command"].as_str().unwrap_or("").to_string();
+            let result = if cmd.is_empty() {
+                ShellResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    code: None,
+                    duration: std::time::Duration::ZERO,
+                    timed_out: false,
+                    error: Some("error: bash call missing 'command' argument".to_string()),
+                }
+            } else {
+                shell.run_result(&cmd)
             };
-            shell.run(cmd)
+            ToolOutcome {
+                command: cmd,
+                result,
+            }
         }
-        other => format!("error: unknown tool '{other}'"),
+        other => ToolOutcome {
+            command: String::new(),
+            result: ShellResult {
+                stdout: String::new(),
+                stderr: String::new(),
+                code: None,
+                duration: std::time::Duration::ZERO,
+                timed_out: false,
+                error: Some(format!("error: unknown tool '{other}'")),
+            },
+        },
     }
 }

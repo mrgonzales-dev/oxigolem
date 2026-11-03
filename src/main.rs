@@ -63,6 +63,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                             return Ok(());
                         }
                     }
+                    KeyCode::Char('e')
+                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                            && app.view == View::Agent =>
+                    {
+                        app.toggle_tool_expand()
+                    }
                     code if app.modal.is_some() => app.modal_key(code),
                     KeyCode::PageUp if app.view == View::Agent => app.scroll_up(10),
                     KeyCode::PageDown if app.view == View::Agent => app.scroll_down(10),

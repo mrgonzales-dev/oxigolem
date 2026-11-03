@@ -5,7 +5,9 @@ use oxigolem::agent::tools;
 fn bash_runs_command_and_captures_stdout() {
     let sh = Shell::new();
     let out = tools::execute(&sh, "bash", &serde_json::json!({"command": "echo hello"}));
-    assert_eq!(out.trim(), "hello");
+    assert_eq!(out.result.stdout.trim(), "hello");
+    assert_eq!(out.result.code, Some(0));
+    assert_eq!(out.command, "echo hello");
 }
 
 #[test]
@@ -16,8 +18,16 @@ fn bash_captures_stderr_and_exit_code() {
         "bash",
         &serde_json::json!({"command": "echo oops >&2; exit 3"}),
     );
-    assert!(out.contains("! oops"), "stderr should be prefixed, got: {out}");
-    assert!(out.contains("exit 3"), "exit code appended, got: {out}");
+    assert!(
+        out.result.stderr.contains("oops"),
+        "stderr captured, got: {:?}",
+        out.result
+    );
+    assert_eq!(out.result.code, Some(3));
+    // Flattened form still carries stderr as `! ` lines + `exit N`.
+    let flat = out.to_tool_message();
+    assert!(flat.contains("! oops"), "got: {flat}");
+    assert!(flat.contains("exit 3"), "got: {flat}");
 }
 
 #[test]
@@ -29,21 +39,35 @@ fn bash_times_out_on_runaway() {
         start.elapsed() < std::time::Duration::from_secs(45),
         "should not wait the full sleep"
     );
-    assert!(out.contains("timed out"), "got: {out}");
+    assert!(out.result.timed_out, "got: {:?}", out.result);
+    assert!(out.result.code.is_none());
+    assert!(out.to_tool_message().contains("timed out"));
 }
 
 #[test]
 fn bash_missing_command_errors() {
     let sh = Shell::new();
     let out = tools::execute(&sh, "bash", &serde_json::json!({}));
-    assert!(out.contains("error"), "got: {out}");
+    assert!(
+        out.result.error.as_deref().unwrap_or("").contains("error"),
+        "got: {:?}",
+        out.result
+    );
 }
 
 #[test]
 fn execute_unknown_tool_errors() {
     let sh = Shell::new();
     let out = tools::execute(&sh, "nope", &serde_json::json!({}));
-    assert!(out.contains("unknown tool"), "got: {out}");
+    assert!(
+        out.result
+            .error
+            .as_deref()
+            .unwrap_or("")
+            .contains("unknown tool"),
+        "got: {:?}",
+        out.result
+    );
 }
 
 #[test]

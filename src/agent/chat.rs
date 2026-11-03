@@ -2,7 +2,10 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 
-use super::{systemprompt::system_prompt, tools};
+use super::{
+    systemprompt::system_prompt,
+    tools::{self, ToolOutcome},
+};
 use crate::provider::{Provider, StreamChunk};
 use crate::shell::Shell;
 
@@ -58,8 +61,10 @@ pub enum ChatEvent {
     Thinking(String),
     /// The model asked to run a tool — UI shows it as a `⎿ $ cmd` line.
     ToolCall { name: String, args: serde_json::Value },
-    /// Tool finished — UI shows its output dimmed.
-    ToolResult { name: String, output: String },
+    /// Tool finished — carries the structured outcome so the UI can
+    /// render a cursor-cli-style block (cmd + stdout + stderr + code +
+    /// duration) instead of a pre-flattened string.
+    ToolResult { name: String, outcome: ToolOutcome },
     /// Generation finished. Carries every message appended this round
     /// (assistant replies + tool results) so history stays complete.
     Done(Vec<Message>),
@@ -163,12 +168,13 @@ impl ChatEngine {
                             name: call.name.clone(),
                             args: call.arguments.clone(),
                         });
-                        let output = tools::execute(&shell, &call.name, &call.arguments);
+                        let outcome = tools::execute(&shell, &call.name, &call.arguments);
+                        let text = outcome.to_tool_message();
                         let _ = tx.send(ChatEvent::ToolResult {
                             name: call.name.clone(),
-                            output: output.clone(),
+                            outcome,
                         });
-                        let tm = Message::tool(&call.name, &output);
+                        let tm = Message::tool(&call.name, &text);
                         msgs.push(tm.clone());
                         appended.push(tm);
                     }

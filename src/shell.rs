@@ -2,13 +2,58 @@ use std::io::Read;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Max time a single command may run before being killed.
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max output chars kept per command — head and tail with a gap marker.
 const MAX_OUTPUT: usize = 4000;
+
+/// Result of one command: raw streams plus exit/timeout metadata. The
+/// agent tool turns this into a `tool` message; the UI renders it as a
+/// structured block (header/output/footer), so we keep streams split
+/// rather than pre-formatted.
+#[derive(Clone, Debug)]
+pub struct ShellResult {
+    pub stdout: String,
+    pub stderr: String,
+    /// Exit code if the process finished; `None` when killed on timeout
+    /// or when spawn failed before a status could be read.
+    pub code: Option<i32>,
+    pub duration: Duration,
+    pub timed_out: bool,
+    /// Spawn-level error (e.g. `bash` missing). When set, stdout/stderr
+    /// are empty and `code` is None.
+    pub error: Option<String>,
+}
+
+impl ShellResult {
+    /// Flatten to the single-string form the Ollama `tool` message and
+    /// the Output-view terminal both expect: stdout lines, stderr lines
+    /// prefixed `! `, `exit N` on nonzero or `timed out` on kill.
+    pub fn to_text(&self) -> String {
+        let mut s = String::new();
+        if let Some(e) = &self.error {
+            s.push_str(e);
+            return s;
+        }
+        if self.timed_out {
+            s.push_str(&format!("! timed out after {}s", TIMEOUT.as_secs()));
+            return s;
+        }
+        s.push_str(&self.stdout);
+        for l in self.stderr.lines() {
+            s.push_str(&format!("! {l}\n"));
+        }
+        if let Some(c) = self.code
+            && c != 0
+        {
+            s.push_str(&format!("exit {c}"));
+        }
+        truncate(&s)
+    }
+}
 
 /// One shared shell for the whole app: the user's Output-view commands and
 /// the model's `bash` tool calls run in the same working directory, so a
@@ -27,12 +72,9 @@ impl Shell {
         }
     }
 
-    /// Run `cmd` in the shared directory. Returns formatted output:
-    /// stdout lines, stderr lines prefixed `! `, `exit N` on failure.
-    /// A bare `cd` updates the shared working directory (a spawned bash
-    /// dies with its cwd, so we track it here). `cd` inside a longer
-    /// compound command affects only that command.
-    pub fn run(&self, cmd: &str) -> String {
+    /// Run `cmd` in the shared directory and return a structured result.
+    /// A bare `cd` updates the shared working directory without spawning.
+    pub fn run_result(&self, cmd: &str) -> ShellResult {
         // Bare `cd` only — a whole command like `cd /tmp`. Compounds
         // (`cd x && y`, `cd x; y`) go through bash where the marker
         // captures the final dir anyway.
@@ -45,9 +87,23 @@ impl Shell {
             };
             if resolved.is_dir() {
                 *cwd = resolved.canonicalize().unwrap_or(resolved);
-                return String::new();
+                return ShellResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    code: Some(0),
+                    duration: Duration::ZERO,
+                    timed_out: false,
+                    error: None,
+                };
             }
-            return format!("! cd: no such directory: {target}\nexit 1");
+            return ShellResult {
+                stdout: String::new(),
+                stderr: format!("cd: no such directory: {target}"),
+                code: Some(1),
+                duration: Duration::ZERO,
+                timed_out: false,
+                error: None,
+            };
         }
 
         let dir = self.cwd.lock().unwrap().clone();
@@ -58,6 +114,7 @@ impl Shell {
         // printf's \0 escape — an actual NUL can't go in argv.
         const MARK: &str = "\0__OXIGOLEM_PWD__\n";
         let wrapped = format!("{cmd}; printf '\\0__OXIGOLEM_PWD__\\n%s' \"$PWD\"");
+        let started = Instant::now();
         let mut child = match unsafe {
             Command::new("bash")
                 .arg("-c")
@@ -74,7 +131,16 @@ impl Shell {
                 .spawn()
         } {
             Ok(c) => c,
-            Err(e) => return format!("spawn failed: {e}"),
+            Err(e) => {
+                return ShellResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    code: None,
+                    duration: started.elapsed(),
+                    timed_out: false,
+                    error: Some(format!("spawn failed: {e}")),
+                }
+            }
         };
         let pgid = child.id() as i32;
 
@@ -106,12 +172,19 @@ impl Shell {
                         libc::kill(pgid, libc::SIGKILL);
                     }
                 }
-                return format!("! timed out after {}s", TIMEOUT.as_secs());
+                return ShellResult {
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    code: None,
+                    duration: started.elapsed(),
+                    timed_out: true,
+                    error: None,
+                };
             }
         };
 
         let raw = String::from_utf8_lossy(&out).to_string();
-        let (lines, new_dir) = match raw.rfind(MARK) {
+        let (stdout, new_dir) = match raw.rfind(MARK) {
             Some(pos) => {
                 let dir = raw[pos + MARK.len()..].trim().to_string();
                 (raw[..pos].to_string(), Some(dir))
@@ -124,16 +197,21 @@ impl Shell {
             *self.cwd.lock().unwrap() = d.into();
         }
 
-        let mut lines = lines;
-        for l in String::from_utf8_lossy(&err).lines() {
-            lines.push_str(&format!("! {l}\n"));
+        ShellResult {
+            stdout,
+            stderr: String::from_utf8_lossy(&err).to_string(),
+            code: status.and_then(|s| s.code()),
+            duration: started.elapsed(),
+            timed_out: false,
+            error: None,
         }
-        if let Some(s) = status
-            && s.code().unwrap_or(-1) != 0
-        {
-            lines.push_str(&format!("exit {}", s.code().unwrap_or(-1)));
-        }
-        truncate(&lines)
+    }
+
+    /// Legacy flattened form: same output the tool message and terminal
+    /// view have always used. Kept so existing callers (app Output view,
+    /// tool message payload) stay one-line.
+    pub fn run(&self, cmd: &str) -> String {
+        self.run_result(cmd).to_text()
     }
 }
 
