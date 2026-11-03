@@ -2,7 +2,7 @@ use oxigolem::agent::chat::{ChatEngine, ChatEvent, Message};
 use oxigolem::agent::tools::ToolSpec;
 use oxigolem::app::{App, Role};
 use oxigolem::provider::ollama::Ollama;
-use oxigolem::provider::{Provider, StreamChunk};
+use oxigolem::provider::{ChatOptions, Provider, StreamChunk};
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -29,7 +29,10 @@ impl MockProvider {
 }
 
 impl Provider for MockProvider {
-    fn name(&self) -> &'static str {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -42,6 +45,7 @@ impl Provider for MockProvider {
         _model: &str,
         _messages: &[Message],
         _tools: &[ToolSpec],
+        _opts: &ChatOptions,
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         for c in self.chunks.lock().unwrap().iter() {
@@ -57,7 +61,10 @@ struct ScriptedProvider {
 }
 
 impl Provider for ScriptedProvider {
-    fn name(&self) -> &'static str {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+fn name(&self) -> &'static str {
         "scripted"
     }
     fn list_models(&self) -> Result<Vec<String>, String> {
@@ -68,6 +75,7 @@ impl Provider for ScriptedProvider {
         _model: &str,
         _messages: &[Message],
         _tools: &[ToolSpec],
+        _opts: &ChatOptions,
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         let turn = self
@@ -149,7 +157,10 @@ fn chat_engine_rejects_concurrent_send() {
 fn chat_engine_propagates_error() {
     struct ErrorProvider;
     impl Provider for ErrorProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "error"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -160,6 +171,7 @@ fn chat_engine_propagates_error() {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("provider failed".to_string())
@@ -225,7 +237,10 @@ fn engine_stops_at_iteration_cap() {
     // Provider always returns a tool call — the loop must not run forever.
     struct AlwaysTool;
     impl Provider for AlwaysTool {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "always"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -236,6 +251,7 @@ fn engine_stops_at_iteration_cap() {
             _m: &str,
             _msgs: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             on_chunk(StreamChunk::ToolCall {
@@ -321,7 +337,7 @@ fn ollama_chat_streams_tokens() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &[], &|c| {
+        .chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
             if !matches!(c, StreamChunk::Usage(_)) {
                 tokens.borrow_mut().push(c)
             }
@@ -357,7 +373,7 @@ fn ollama_sends_tools_in_request() {
     });
     let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|_| {})
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|_| {})
         .unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let json_start = req.find('{').unwrap();
@@ -380,7 +396,7 @@ fn ollama_parses_tool_calls_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|c| {
             if !matches!(c, StreamChunk::Usage(_)) {
                 chunks.borrow_mut().push(c)
             }
@@ -410,7 +426,7 @@ fn ollama_parses_tool_calls_on_done_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|c| {
             if !matches!(c, StreamChunk::Usage(_)) {
                 chunks.borrow_mut().push(c)
             }
@@ -454,7 +470,7 @@ fn ollama_serializes_tool_messages_back() {
         assistant,
         Message::tool("bash", "file.rs"),
     ];
-    provider.chat("m", &msgs, &[], &|_| {}).unwrap();
+    provider.chat("m", &msgs, &[], &ChatOptions::default(), &|_| {}).unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let json_start = req.find('{').unwrap();
     let v: serde_json::Value = serde_json::from_str(&req[json_start..]).unwrap();
@@ -490,7 +506,7 @@ fn ollama_chat_no_total_stream_timeout() {
     let tokens = RefCell::new(Vec::new());
     let start = std::time::Instant::now();
     provider
-        .chat("m", &test_messages(), &[], &|c| {
+        .chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
             if !matches!(c, StreamChunk::Usage(_)) {
                 tokens.borrow_mut().push(c)
             }
@@ -521,7 +537,7 @@ fn ollama_chat_error_surfaces_server_message() {
 
     let provider = Ollama::new(host);
     let err = provider
-        .chat("x", &test_messages(), &[], &|_| {})
+        .chat("x", &test_messages(), &[], &ChatOptions::default(), &|_| {})
         .unwrap_err();
     assert!(
         err.contains("model 'x' not found"),
@@ -552,6 +568,7 @@ fn ollama_chat_tolerates_abrupt_close_mid_stream() {
         "m",
         &test_messages(),
         &[],
+        &ChatOptions::default(),
         &|c| tokens.borrow_mut().push(c),
     );
     assert!(res.is_ok(), "expected Ok, got {res:?}");
@@ -580,7 +597,7 @@ fn ollama_chat_surfaces_thinking() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &[], &|c| {
+        .chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
             if !matches!(c, StreamChunk::Usage(_)) {
                 tokens.borrow_mut().push(c)
             }
@@ -664,7 +681,10 @@ fn app_tool_events_render_as_tool_entries() {
 fn app_chat_error_goes_to_transcript() {
     struct ErrorProvider;
     impl Provider for ErrorProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "error"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -675,6 +695,7 @@ fn app_chat_error_goes_to_transcript() {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("chat request failed: http://localhost:11434/api/chat: connection refused".into())
@@ -720,7 +741,10 @@ fn enter_while_busy_queues_prompt() {
     // Provider that streams slowly so we can enqueue mid-generation.
     struct SlowProvider;
     impl Provider for SlowProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -731,6 +755,7 @@ fn enter_while_busy_queues_prompt() {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             // Emit one chunk then linger — gives the test time to queue.
@@ -763,7 +788,10 @@ fn enter_while_busy_queues_prompt() {
 fn second_enter_force_sends_immediately() {
     struct SlowProvider;
     impl Provider for SlowProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -774,6 +802,7 @@ fn second_enter_force_sends_immediately() {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             on_chunk(StreamChunk::Content("hi".into()));
@@ -814,7 +843,10 @@ fn second_enter_force_sends_immediately() {
 fn esc_cancels_in_flight_generation() {
     struct SlowProvider;
     impl Provider for SlowProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -825,6 +857,7 @@ fn esc_cancels_in_flight_generation() {
             _model: &str,
             _messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             on_chunk(StreamChunk::Content("hi".into()));
@@ -870,7 +903,7 @@ fn ollama_done_chunk_parses_usage() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &[], &|c| {
+        .chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
             chunks.borrow_mut().push(c)
         })
         .unwrap();
@@ -904,7 +937,7 @@ fn ollama_done_chunk_missing_cached_counts_as_zero() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &[], &|c| {
+        .chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
             chunks.borrow_mut().push(c)
         })
         .unwrap();
@@ -1007,7 +1040,10 @@ fn send_stubbs_old_tool_results_in_request() {
         seen: Mutex<Vec<Vec<Message>>>,
     }
     impl Provider for RecordingProvider {
-        fn name(&self) -> &'static str {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+fn name(&self) -> &'static str {
             "rec"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -1018,6 +1054,7 @@ fn send_stubbs_old_tool_results_in_request() {
             _model: &str,
             messages: &[Message],
             _tools: &[ToolSpec],
+            _opts: &ChatOptions,
             on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             self.seen.lock().unwrap().push(messages.to_vec());

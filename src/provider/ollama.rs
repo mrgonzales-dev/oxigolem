@@ -1,13 +1,120 @@
+use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
+use std::sync::Mutex;
 use std::time::Duration;
 
-use super::{Provider, StreamChunk};
+use super::{ChatOptions, Provider, StreamChunk};
 use crate::agent::chat::Message;
 use crate::agent::tools::{self, ToolSpec};
+
+/// What `/api/show` tells us about a model — cached in memory and on
+/// disk (`.oxigolem/models.json`) so every turn doesn't re-ask.
+#[derive(Clone, Debug)]
+pub struct ModelInfo {
+    /// `model_info.*.context_length` — the trained context window.
+    pub context_length: u64,
+    /// `capabilities` — e.g. ["completion","tools","thinking"].
+    pub capabilities: Vec<String>,
+    /// `model_info.*.parameter_count` (0 when absent).
+    pub parameter_count: u64,
+    /// Raw `model_info` map — `kv_bytes_per_token` digs the geometry out.
+    pub raw: serde_json::Value,
+}
+
+impl ModelInfo {
+    pub fn supports(&self, cap: &str) -> bool {
+        self.capabilities.iter().any(|c| c == cap)
+    }
+
+    /// Whether reasoning should be sent as `think:true`. Default is
+    /// off — thinking eats context a small model can't spare. A
+    /// per-model override in `.oxigolem/config.json`
+    /// (`models.<name>.think`) flips it back on.
+    pub fn think_for(&self, model: &str) -> bool {
+        if let Some(v) = config_model(model, "think") {
+            return v;
+        }
+        self.think_default()
+    }
+
+    /// Default think flag: always off (we keep reasoning visible via
+    /// the stream but don't pay its prefill unless the user asks).
+    pub fn think_default(&self) -> bool {
+        false
+    }
+}
+
+/// Read a per-model knob out of `.oxigolem/config.json`.
+/// `$OXIGOLEM_CONFIG_DIR` overrides the directory (tests).
+fn config_model(model: &str, key: &str) -> Option<bool> {
+    let dir = config_dir()?;
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v["models"][model][key].as_bool()
+}
+
+fn config_dir() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("OXIGOLEM_CONFIG_DIR") {
+        return Some(d.into());
+    }
+    std::env::current_dir().ok().map(|d| d.join(".oxigolem"))
+}
+
+/// KV-cache footprint of one token: 2 (K+V) × layers × kv_heads ×
+/// head_dim × 2 bytes. Used to budget num_ctx against free RAM.
+/// Returns None when the geometry isn't in model_info.
+pub fn kv_bytes_per_token(model_info: &serde_json::Value) -> Option<u64> {
+    // Find the arch-prefixed namespace (e.g. "qwen3.*") by locating
+    // any key that ends with ".block_count".
+    let obj = model_info.as_object()?;
+    let prefix = obj.keys().find_map(|k| {
+        k.strip_suffix(".block_count").map(|p| p.to_string())
+    })?;
+    let get = |suffix: &str| obj.get(&format!("{prefix}{suffix}"))?.as_u64();
+    let layers = get(".block_count")?;
+    let kv_heads = get(".attention.head_count_kv")?;
+    let heads = get(".attention.head_count")?;
+    let emb = get(".embedding_length")?;
+    if heads == 0 {
+        return None;
+    }
+    let head_dim = emb / heads;
+    Some(2 * layers * kv_heads * head_dim * 2)
+}
+
+/// Pick the context window: `OXIGOLEM_NUM_CTX` env beats everything;
+/// otherwise the smaller of the model's trained context and what the
+/// RAM budget can hold (¼ of available bytes for KV), never under 8192.
+pub fn resolve_num_ctx(model_ctx: u64, avail_ram: u64, kv_per_token: Option<u64>) -> u64 {
+    const FLOOR: u64 = 8192;
+    if let Ok(v) = std::env::var("OXIGOLEM_NUM_CTX")
+        && let Ok(n) = v.trim().parse::<u64>() {
+            return n.max(FLOOR.min(n)); // env wins outright, even below floor
+        }
+    let budgeted = kv_per_token
+        .and_then(|b| (avail_ram / 4).checked_div(b))
+        .unwrap_or(0);
+    model_ctx.min(budgeted).max(FLOOR)
+}
+
+/// Free RAM for the KV budget — MemAvailable from /proc/meminfo,
+/// 8 GiB fallback when unreadable.
+pub fn avail_ram_bytes() -> u64 {
+    let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:")
+            && let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
+                return kb * 1024;
+            }
+    }
+    8 << 30
+}
 
 pub struct Ollama {
     host: String,
     agent: ureq::Agent,
+    /// inspect() memoization — model name → ModelInfo.
+    info_cache: Mutex<HashMap<String, ModelInfo>>,
 }
 
 impl Ollama {
@@ -15,7 +122,100 @@ impl Ollama {
         Self {
             host: host.into(),
             agent: new_agent(),
+            info_cache: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Fetch `context_length`/`capabilities`/geometry via `/api/show`.
+    /// Memoized in memory and persisted to `.oxigolem/models.json` —
+    /// model cards don't change between turns.
+    pub fn inspect(&self, model: &str) -> Result<ModelInfo, String> {
+        if let Some(info) = self.info_cache.lock().unwrap().get(model) {
+            return Ok(info.clone());
+        }
+        if let Some(info) = read_model_cache(model) {
+            self.info_cache
+                .lock()
+                .unwrap()
+                .insert(model.to_string(), info.clone());
+            return Ok(info);
+        }
+
+        let url = format!("{}/api/show", self.host.trim_end_matches('/'));
+        let body: serde_json::Value = self
+            .agent
+            .post(&url)
+            .send_json(serde_json::json!({ "model": model }))
+            .map_err(|e| chat_error(&url, e))?
+            .into_json()
+            .map_err(|e| format!("bad /api/show response: {e}"))?;
+
+        let raw = body["model_info"].clone();
+        let obj = raw.as_object().cloned().unwrap_or_default();
+        // Arch-prefixed lookup — find "<arch>.context_length".
+        let get = |suffix: &str| -> u64 {
+            obj.iter()
+                .find(|(k, _)| k.ends_with(suffix))
+                .and_then(|(_, v)| v.as_u64())
+                .unwrap_or(0)
+        };
+        let info = ModelInfo {
+            context_length: get(".context_length"),
+            capabilities: body["capabilities"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+                .unwrap_or_default(),
+            parameter_count: get(".parameter_count"),
+            raw,
+        };
+        write_model_cache(model, &info);
+        self.info_cache
+            .lock()
+            .unwrap()
+            .insert(model.to_string(), info.clone());
+        Ok(info)
+    }
+}
+
+fn model_cache_path() -> Option<std::path::PathBuf> {
+    config_dir().map(|d| d.join("models.json"))
+}
+
+fn read_model_cache(model: &str) -> Option<ModelInfo> {
+    let text = std::fs::read_to_string(model_cache_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let e = &v[model];
+    if e.is_null() {
+        return None;
+    }
+    Some(ModelInfo {
+        context_length: e["context_length"].as_u64()?,
+        capabilities: e["capabilities"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+            .unwrap_or_default(),
+        parameter_count: e["parameter_count"].as_u64().unwrap_or(0),
+        raw: e["model_info"].clone(),
+    })
+}
+
+fn write_model_cache(model: &str, info: &ModelInfo) {
+    let Some(path) = model_cache_path() else { return };
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[model] = serde_json::json!({
+        "context_length": info.context_length,
+        "capabilities": info.capabilities,
+        "parameter_count": info.parameter_count,
+        "model_info": info.raw,
+    });
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&path, s);
     }
 }
 
@@ -44,11 +244,16 @@ impl Default for Ollama {
         Self {
             host,
             agent: new_agent(),
+            info_cache: Mutex::new(HashMap::new()),
         }
     }
 }
 
 impl Provider for Ollama {
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
     fn name(&self) -> &'static str {
         "ollama"
     }
@@ -83,6 +288,7 @@ impl Provider for Ollama {
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        opts: &ChatOptions,
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
@@ -117,6 +323,14 @@ impl Provider for Ollama {
             "model": model,
             "messages": messages_json,
             "stream": true,
+            "keep_alive": "30m",
+            "think": opts.think,
+            "options": {
+                "num_ctx": opts.num_ctx,
+                "num_predict": 2048,
+                "temperature": 0.1,
+                "top_p": 0.9,
+            },
         });
         if !tools.is_empty() {
             body["tools"] = tools::to_json(tools);

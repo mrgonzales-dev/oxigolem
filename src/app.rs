@@ -230,12 +230,41 @@ impl App {
                     provider: self.providers[provider].name(),
                     model: choice.clone(),
                 });
-                self.chat = Some(ChatEngine::with_all(
-                    p,
-                    choice,
+                let mut engine = ChatEngine::with_all(
+                    Arc::clone(&p),
+                    choice.clone(),
                     self.shell.clone(),
                     Arc::clone(&self.shells),
-                ));
+                );
+                // Resolve num_ctx + think from the model card once —
+                // every request this session uses the same options so
+                // the prompt prefix (and its KV cache) stays stable.
+                if let Some(ollama) = p.as_any().downcast_ref::<crate::provider::ollama::Ollama>() {
+                    match ollama.inspect(&choice) {
+                        Ok(info) => {
+                            if !info.supports("tools") {
+                                self.toast = Some(
+                                    format!("{choice}: no tools capability — fenced mode")
+                                );
+                                engine.set_fenced(true);
+                            }
+                            let kv = crate::provider::ollama::kv_bytes_per_token(&info.raw);
+                            let num_ctx = crate::provider::ollama::resolve_num_ctx(
+                                info.context_length,
+                                crate::provider::ollama::avail_ram_bytes(),
+                                kv,
+                            );
+                            engine.set_options(crate::provider::ChatOptions {
+                                num_ctx,
+                                think: info.think_for(&choice),
+                            });
+                        }
+                        Err(e) => {
+                            self.toast = Some(format!("inspect failed: {e}"));
+                        }
+                    }
+                }
+                self.chat = Some(engine);
                 None
             }
             Kind::Message(_) => None,

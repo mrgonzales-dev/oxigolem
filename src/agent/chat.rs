@@ -9,7 +9,7 @@ use super::{
     systemprompt::system_prompt,
     tools::{self, ToolOutcome},
 };
-use crate::provider::{Provider, StreamChunk, Usage};
+use crate::provider::{ChatOptions, Provider, StreamChunk, Usage};
 use crate::shell::{new_bg_shells, BgShells, Shell};
 
 /// A tool call requested by the model (Ollama `message.tool_calls` shape).
@@ -103,6 +103,12 @@ pub struct ChatEngine {
     /// process keeps running as a normal background shell, and the tool
     /// result hands the model the shell id + log path instead of output.
     demote: Arc<AtomicBool>,
+    /// Resolved generation options (num_ctx / think) — set once when
+    /// the model is picked via `set_options`.
+    opts: ChatOptions,
+    /// True when inspect() reports no "tools" capability — Phase 4
+    /// reads this to enable fenced-block tool-call repair.
+    fenced: bool,
 }
 
 impl ChatEngine {
@@ -127,7 +133,22 @@ impl ChatEngine {
             shell,
             shells,
             demote: Arc::new(AtomicBool::new(false)),
+            opts: ChatOptions::default(),
+            fenced: false,
         }
+    }
+
+    /// Swap in resolved options (num_ctx/think from inspect()).
+    /// Called once after model selection — never mid-generation.
+    pub fn set_options(&mut self, opts: ChatOptions) {
+        self.opts = opts;
+    }
+
+    /// Mark the model as lacking native tool support — Phase 4 uses
+    /// this to turn on fenced-block repair instead of tools[] calls.
+    /// Stored now so the capability toast can land before Phase 4 ships.
+    pub fn set_fenced(&mut self, fenced: bool) {
+        self.fenced = fenced;
     }
 
     pub fn is_busy(&self) -> bool {
@@ -155,6 +176,7 @@ impl ChatEngine {
         let shells = Arc::clone(&self.shells);
         let demote = Arc::clone(&self.demote);
         let cancel = Arc::clone(&self.cancel);
+        let opts = self.opts.clone();
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
         msgs.push(Message::system(&system_prompt()));
         msgs.extend(prune_history(&self.history));
@@ -176,8 +198,9 @@ impl ChatEngine {
                         let model = model.clone();
                         let msgs = msgs.clone();
                         let specs = tools::specs();
+                        let opts = opts.clone();
                         thread::spawn(move || {
-                            let r = provider.chat(&model, &msgs, &specs, &|chunk| {
+                            let r = provider.chat(&model, &msgs, &specs, &opts, &|chunk| {
                                 let _ = ptx.send(Ok(chunk));
                             });
                             let _ = ptx.send(match r {

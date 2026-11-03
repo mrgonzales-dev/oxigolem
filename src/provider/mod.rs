@@ -62,19 +62,43 @@ pub enum StreamChunk {
     Usage(Usage),
 }
 
+/// Per-request generation options resolved once when a model is
+/// selected (Phase 1: inspect → num_ctx → think). Passed through to
+/// `Provider::chat` so every turn uses the same knobs.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChatOptions {
+    /// Context window sent as `options.num_ctx`.
+    pub num_ctx: u64,
+    /// `think` field — false disables reasoning on thinking models.
+    pub think: bool,
+}
+
+impl Default for ChatOptions {
+    fn default() -> Self {
+        Self {
+            num_ctx: 8192,
+            think: true,
+        }
+    }
+}
+
 /// A model backend oxigolem can connect to.
-pub trait Provider: Send + Sync {
+pub trait Provider: Send + Sync + std::any::Any + 'static {
+    /// Lets the app reach provider-specific extras (e.g. Ollama::inspect).
+    fn as_any(&self) -> &dyn std::any::Any;
     fn name(&self) -> &'static str;
     fn list_models(&self) -> Result<Vec<String>, String>;
 
     /// Stream a chat completion. `on_chunk` is called for each chunk, tagged
     /// by whether it's answer text, reasoning, or a tool call. `tools` is
     /// the registry of tools the model may invoke (empty = none offered).
+    /// `opts` carries the resolved generation options.
     fn chat(
         &self,
         model: &str,
         messages: &[Message],
         tools: &[ToolSpec],
+        opts: &ChatOptions,
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String>;
 }
