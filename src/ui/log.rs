@@ -27,6 +27,7 @@ pub fn draw(
     gen_done_tick: Option<u64>,
     shells: &BgShells,
     occlude: Option<Rect>,
+    report_bottom: &std::cell::Cell<u16>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
@@ -434,8 +435,11 @@ pub fn draw(
         .map(|l| (l.width().max(1)).div_ceil(w))
         .sum();
     let bottom = total.saturating_sub(area.height as usize);
+    report_bottom.set(bottom.min(u16::MAX as usize) as u16);
     let scroll = match scroll_back {
-        Some(back) => bottom.saturating_sub(back as usize) as u16,
+        // Clamp the pin to the real range so a stale or overflowed
+        // value can never lock the view at the top.
+        Some(back) => bottom.saturating_sub((back as usize).min(bottom)) as u16,
         None => bottom as u16,
     };
 
@@ -472,8 +476,9 @@ pub fn draw(
             .map(|l| (l.width().max(1)).div_ceil(w))
             .sum();
         let bottom = total.saturating_sub(area.height as usize);
+        report_bottom.set(bottom.min(u16::MAX as usize) as u16);
         let scroll = match scroll_back {
-            Some(back) => bottom.saturating_sub(back as usize) as u16,
+            Some(back) => bottom.saturating_sub((back as usize).min(bottom)) as u16,
             None => bottom as u16,
         };
         let p = Paragraph::new(lines)

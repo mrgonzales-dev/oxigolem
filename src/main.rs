@@ -176,11 +176,12 @@ fn draw(f: &mut ratatui::Frame, app: &App, scope: Option<ui::scope::ScopeInput>)
             app.gen_done_tick,
             &app.shells,
             scope_rect,
+            &app.last_log_bottom,
         ),
         View::Shell(i) => {
             let reg = app.shells.lock().unwrap();
             if let Some(sh) = reg.get(i) {
-                ui::output::draw(f, body, sh, app.term_scroll);
+                ui::output::draw(f, body, sh, app.term_scroll, &app.last_term_bottom);
             }
         }
     }

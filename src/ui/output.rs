@@ -15,7 +15,13 @@ use crate::{
 /// then stderr as `! `-prefixed lines (streams aren't interleaved —
 /// the log files keep each stream whole). Blue accent separates this
 /// surface from the orange agent view.
-pub fn draw(f: &mut Frame, area: Rect, sh: &BgShell, scroll_back: Option<u16>) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    sh: &BgShell,
+    scroll_back: Option<u16>,
+    report_bottom: &std::cell::Cell<u16>,
+) {
     let mut lines: Vec<String> = sh.snapshot();
     let status_label = match sh.status() {
         BgStatus::Running => "running".to_string(),
@@ -41,8 +47,9 @@ pub fn draw(f: &mut Frame, area: Rect, sh: &BgShell, scroll_back: Option<u16>) {
     let total: usize = text.iter().map(|l| (l.width().max(1)).div_ceil(w)).sum();
     let inner_h = area.height.saturating_sub(2) as usize;
     let bottom = total.saturating_sub(inner_h);
+    report_bottom.set(bottom.min(u16::MAX as usize) as u16);
     let scroll = match scroll_back {
-        Some(back) => bottom.saturating_sub(back as usize) as u16,
+        Some(back) => bottom.saturating_sub((back as usize).min(bottom)) as u16,
         None => bottom as u16,
     };
 

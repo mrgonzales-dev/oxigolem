@@ -83,10 +83,20 @@ pub struct App {
     pub tick: u64,
     /// Manual scrollback offset (visual rows up from the bottom).
     /// `None` = follow newest; `Some(n)` = pinned n rows up.
+    /// Values are clamped against `last_log_bottom` on every scroll
+    /// so a stale pin can never lock the view (e.g. after `/clear`, a
+    /// resize, or a wheel burst that pinned past the top).
     pub scroll_back: Option<u16>,
+    /// Last renderable bottom row reported by `ui::log::draw` — lets
+    /// `scroll_up`/`scroll_down` clamp the pin so it stays inside the
+    /// transcript instead of pinning past row 0 and locking the view.
+    pub last_log_bottom: std::cell::Cell<u16>,
     /// Same scroll-pin idea for Shell views — kept separate from
     /// `scroll_back` so each view remembers its own position.
     pub term_scroll: Option<u16>,
+    /// Renderable bottom row of the shell pane — `ui::output::draw`
+    /// reports it so term scroll clamps like the agent log does.
+    pub last_term_bottom: std::cell::Cell<u16>,
     /// Tick when the last generation finished — drives the shimmer→dim
     /// fade so thinking text eases out instead of snapping.
     pub gen_done_tick: Option<u64>,
@@ -150,7 +160,9 @@ impl App {
             shells: new_bg_shells(),
             tick: 0,
             scroll_back: None,
+            last_log_bottom: std::cell::Cell::new(0),
             term_scroll: None,
+            last_term_bottom: std::cell::Cell::new(0),
             gen_done_tick: None,
             last_usage: None,
             models_rx: None,
@@ -199,13 +211,21 @@ impl App {
     }
 
     /// Scroll the agent transcript up `n` visual rows (pin position).
+    /// Clamps at `last_log_bottom` so the pin can never run past the
+    /// top of the transcript — the old bug where a wheel burst left
+    /// `scroll_back` huge and `scroll_down` couldn't dig back out.
     pub fn scroll_up(&mut self, n: u16) {
-        self.scroll_back = Some(self.scroll_back.unwrap_or(0).saturating_add(n));
+        let cap = self.last_log_bottom.get();
+        let cur = self.scroll_back.unwrap_or(0).min(cap);
+        self.scroll_back = Some(cur.saturating_add(n).min(cap));
     }
 
-    /// Scroll down; reaching the bottom re-engages auto-follow.
+    /// Scroll down; reaching the bottom re-engages auto-follow. A pin
+    /// above the transcript's top is normalised to the top first so a
+    /// single scroll-down step always visibly moves the view.
     pub fn scroll_down(&mut self, n: u16) {
         if let Some(v) = self.scroll_back {
+            let v = v.min(self.last_log_bottom.get());
             match v.checked_sub(n) {
                 Some(0) | None => self.scroll_back = None,
                 Some(rest) => self.scroll_back = Some(rest),
@@ -213,13 +233,17 @@ impl App {
         }
     }
 
-    /// Shell-view scroll — same pin semantics on the bg-shell buffer.
+    /// Shell-view scroll — same pin semantics on the bg-shell buffer,
+    /// same clamp so a wheel burst can't lock the view at the top.
     pub fn term_scroll_up(&mut self, n: u16) {
-        self.term_scroll = Some(self.term_scroll.unwrap_or(0).saturating_add(n));
+        let cap = self.last_term_bottom.get();
+        let cur = self.term_scroll.unwrap_or(0).min(cap);
+        self.term_scroll = Some(cur.saturating_add(n).min(cap));
     }
 
     pub fn term_scroll_down(&mut self, n: u16) {
         if let Some(v) = self.term_scroll {
+            let v = v.min(self.last_term_bottom.get());
             match v.checked_sub(n) {
                 Some(0) | None => self.term_scroll = None,
                 Some(rest) => self.term_scroll = Some(rest),
@@ -780,6 +804,9 @@ impl App {
             expanded: false,
             done_tick: None,
         });
+        // Sending always snaps to the bottom — a manual pin would
+        // otherwise hide the prompt + reply the user just triggered.
+        self.scroll_back = None;
         self.gen_done_tick = None;
         if let Err(e) = self.chat.as_mut().unwrap().send(text) {
             self.toast = Some(e);
