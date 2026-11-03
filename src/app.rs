@@ -48,6 +48,8 @@ pub struct App {
     pub transcript: Vec<TranscriptEntry>,
     providers: Vec<Arc<dyn Provider>>,
     pub chat: Option<ChatEngine>,
+    /// Frame counter for animations — bumps every loop tick.
+    pub tick: u64,
 }
 
 impl App {
@@ -63,7 +65,13 @@ impl App {
             transcript: Vec::new(),
             providers: provider::registry(),
             chat: None,
+            tick: 0,
         }
+    }
+
+    /// True while a generation is still streaming.
+    pub fn chat_busy(&self) -> bool {
+        self.chat.as_ref().is_some_and(|c| c.is_busy())
     }
 
     pub fn open_palette(&mut self) {

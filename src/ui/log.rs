@@ -1,6 +1,6 @@
 use ratatui::{
     layout::Rect,
-    style::{Modifier, Style},
+    style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
     Frame,
@@ -8,19 +8,25 @@ use ratatui::{
 
 use crate::{
     app::{Role, TranscriptEntry},
-    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT, USER_BG},
+    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT, THINK_HOT, USER_BG},
 };
 
 /// Claude Code-style transcript: no box, no borders. The assistant speaks
 /// under an orange `●`, the user under a faint `>`, tool output dimmed.
-pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
+pub fn draw(
+    f: &mut Frame,
+    area: Rect,
+    transcript: &[TranscriptEntry],
+    thinking_live: bool,
+    tick: u64,
+) {
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
     let pad = "  ";
     // Extra indent for thinking/reply bodies past the marker.
     let body = "  ";
 
-    for entry in transcript {
+    for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
             Role::User => {
                 // "> text" — the user's own words on a gray highlight strip.
@@ -42,16 +48,25 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
                 lines.push(Line::default());
             }
             Role::Thinking => {
-                // "✻ reasoning…" — thinking in its own dimmed block.
+                // "✻ reasoning…" — while the model is mid-generation the
+                // last thinking block gets a traveling orange→white shimmer;
+                // once done it settles to plain FAINT text.
+                let live = thinking_live && ei + 1 == transcript.len();
+                let mut col = 0usize;
                 for (i, l) in entry.text.lines().enumerate() {
                     let marker = if i == 0 { "✻ " } else { "  " };
-                    lines.push(Line::from(vec![
-                        Span::styled(pad.to_string() + marker, Style::default().fg(FAINT)),
-                        Span::styled(
-                            format!("{body}{l}{body}"),
-                            Style::default().fg(FAINT).add_modifier(Modifier::DIM),
-                        ),
-                    ]));
+                    let mut spans = vec![Span::styled(
+                        pad.to_string() + marker,
+                        Style::default().fg(FAINT),
+                    )];
+                    for c in format!("{body}{l}{body}").chars() {
+                        spans.push(Span::styled(
+                            c.to_string(),
+                            Style::default().fg(shade(live, col, tick)),
+                        ));
+                        col += 1;
+                    }
+                    lines.push(Line::from(spans));
                 }
                 lines.push(Line::default());
             }
@@ -92,4 +107,19 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
 
     let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(p, area);
+}
+
+/// Color for one character of live thinking text: a sine wave between
+/// ORANGE and THINK_HOT traveling rightward as `tick` advances.
+fn shade(live: bool, col: usize, tick: u64) -> Color {
+    if !live {
+        return FAINT;
+    }
+    let Color::Rgb(r1, g1, b1) = ORANGE else { return ORANGE };
+    let Color::Rgb(r2, g2, b2) = THINK_HOT else { return THINK_HOT };
+    // Period ~24 columns; phase drifts left→right with the frame count.
+    let phase = (col as f32 - tick as f32 * 0.8) * (std::f32::consts::TAU / 24.0);
+    let t = (phase.sin() + 1.0) / 2.0; // 0..1
+    let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
+    Color::Rgb(lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
 }

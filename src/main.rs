@@ -37,6 +37,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         terminal.draw(|f| draw(f, &app))?;
 
         app.poll_chat();
+        app.tick = app.tick.wrapping_add(1);
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
@@ -90,7 +91,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .split(area);
 
     match app.view {
-        View::Agent => ui::log::draw(f, root[0], &app.transcript),
+        View::Agent => ui::log::draw(f, root[0], &app.transcript, app.chat_busy(), app.tick),
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }
 
