@@ -2,8 +2,8 @@ use oxigolem::app::{App, View};
 use oxigolem::ui;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
-        KeyModifiers,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
+        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
@@ -19,14 +19,19 @@ use std::time::Duration;
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste)?;
+    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
     let res = run(&mut terminal);
 
     disable_raw_mode()?;
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableBracketedPaste)?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableBracketedPaste,
+        DisableMouseCapture
+    )?;
     res
 }
 
@@ -41,6 +46,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
+                Event::Mouse(m) if app.view == View::Agent && app.modal.is_none() => {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => app.scroll_up(3),
+                        MouseEventKind::ScrollDown => app.scroll_down(3),
+                        _ => {}
+                    }
+                }
                 Event::Paste(text) if app.modal.is_none() => app.push_paste(text),
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -52,6 +64,10 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                         }
                     }
                     code if app.modal.is_some() => app.modal_key(code),
+                    KeyCode::PageUp if app.view == View::Agent => app.scroll_up(10),
+                    KeyCode::PageDown if app.view == View::Agent => app.scroll_down(10),
+                    KeyCode::Up if app.view == View::Agent => app.scroll_up(1),
+                    KeyCode::Down if app.view == View::Agent => app.scroll_down(1),
                     KeyCode::BackTab => {
                         app.dismiss_toast();
                         app.toggle_view();
@@ -91,7 +107,14 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .split(area);
 
     match app.view {
-        View::Agent => ui::log::draw(f, root[0], &app.transcript, app.chat_busy(), app.tick),
+        View::Agent => ui::log::draw(
+            f,
+            root[0],
+            &app.transcript,
+            app.chat_busy(),
+            app.tick,
+            app.scroll_back,
+        ),
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }
 

@@ -19,6 +19,7 @@ pub fn draw(
     transcript: &[TranscriptEntry],
     thinking_live: bool,
     tick: u64,
+    scroll_back: Option<u16>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
@@ -105,14 +106,19 @@ pub fn draw(
         }
     }
 
-    // Auto-scroll to the newest entry. Scroll is in wrapped visual rows,
-    // so estimate each line's row cost at the render width.
+    // Scroll is in wrapped visual rows — estimate each line's row cost at
+    // the render width. `scroll_back` pins a manual offset from the bottom;
+    // None follows the newest entry.
     let w = area.width.max(1) as usize;
     let total: usize = lines
         .iter()
         .map(|l| (l.width().max(1)).div_ceil(w))
         .sum();
-    let scroll = total.saturating_sub(area.height as usize) as u16;
+    let bottom = total.saturating_sub(area.height as usize);
+    let scroll = match scroll_back {
+        Some(back) => bottom.saturating_sub(back as usize) as u16,
+        None => bottom as u16,
+    };
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));

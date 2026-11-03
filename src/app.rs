@@ -50,6 +50,9 @@ pub struct App {
     pub chat: Option<ChatEngine>,
     /// Frame counter for animations — bumps every loop tick.
     pub tick: u64,
+    /// Manual scrollback offset (visual rows up from the bottom).
+    /// `None` = follow newest; `Some(n)` = pinned n rows up.
+    pub scroll_back: Option<u16>,
 }
 
 impl App {
@@ -66,6 +69,22 @@ impl App {
             providers: provider::registry(),
             chat: None,
             tick: 0,
+            scroll_back: None,
+        }
+    }
+
+    /// Scroll the agent transcript up `n` visual rows (pin position).
+    pub fn scroll_up(&mut self, n: u16) {
+        self.scroll_back = Some(self.scroll_back.unwrap_or(0).saturating_add(n));
+    }
+
+    /// Scroll down; reaching the bottom re-engages auto-follow.
+    pub fn scroll_down(&mut self, n: u16) {
+        if let Some(v) = self.scroll_back {
+            match v.checked_sub(n) {
+                Some(0) | None => self.scroll_back = None,
+                Some(rest) => self.scroll_back = Some(rest),
+            }
         }
     }
 
