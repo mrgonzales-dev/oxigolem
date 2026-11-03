@@ -25,14 +25,14 @@ pub fn draw(
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
     let pad = "  ";
-    // Inner margin for thinking/reply bodies — sits the text in from the
-    // marker and the right edge.
-    let body = "    ";
+    // Right-edge margin for thinking/reply bodies — left side stays tight
+    // against the marker so there's no dead column between them.
+    let rmargin = "    ";
 
-    // Width available for body text once the marker and side margins are
-    // subtracted — used to pre-wrap thinking/golem so wrapped rows keep
-    // both margins instead of hugging column 0 / the right edge.
-    let body_w = (area.width as usize).saturating_sub(pad.len() + 2 + body.len() * 2);
+    // Width available for body text once the marker and right margin are
+    // subtracted — pre-wrap thinking/golem so wrapped rows keep the right
+    // margin instead of hugging the edge.
+    let body_w = (area.width as usize).saturating_sub(pad.len() + 2 + rmargin.len());
 
     for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
@@ -79,7 +79,7 @@ pub fn draw(
                         let marker = if first { "✻ " } else { "  " };
                         first = false;
                         let mut spans = vec![Span::styled(
-                            pad.to_string() + marker + body,
+                            pad.to_string() + marker,
                             Style::default().fg(FAINT),
                         )];
                         for c in l.chars() {
@@ -111,7 +111,6 @@ pub fn draw(
                                 .fg(ORANGE)
                                 .add_modifier(Modifier::BOLD),
                         ));
-                        prefixed.spans.push(Span::raw(body));
                         prefixed.spans.extend(sub);
                         lines.push(prefixed);
                     }
