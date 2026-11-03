@@ -297,6 +297,7 @@ impl App {
             role: Role::User,
             text: text.clone(),
         });
+        self.gen_done_tick = None;
         if let Err(e) = self.chat.as_mut().unwrap().send(text) {
             self.toast = Some(e);
             self.transcript.pop();
@@ -313,6 +314,11 @@ impl App {
                     Self::append_or_push(&mut self.transcript, Role::Thinking, t);
                 }
                 ChatEvent::Token(token) => {
+                    // First reply token after a thinking block starts the
+                    // shimmer→dim fade immediately, not at Done.
+                    if self.transcript.last().is_some_and(|e| matches!(e.role, Role::Thinking)) {
+                        self.gen_done_tick = Some(self.tick);
+                    }
                     Self::append_or_push(&mut self.transcript, Role::Golem, token);
                 }
                 ChatEvent::Done => {
