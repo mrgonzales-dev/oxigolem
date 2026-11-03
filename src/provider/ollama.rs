@@ -6,6 +6,26 @@ use crate::chat::Message;
 
 pub struct Ollama {
     host: String,
+    agent: ureq::Agent,
+}
+
+impl Ollama {
+    pub fn new(host: impl Into<String>) -> Self {
+        Self {
+            host: host.into(),
+            agent: new_agent(),
+        }
+    }
+}
+
+/// Agent for chat: no total deadline (streams can be long), generous
+/// per-read timeout so a stalled connection errors out, and a short
+/// connect timeout so a dead host fails fast.
+fn new_agent() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(5))
+        .timeout_read(Duration::from_secs(300))
+        .build()
 }
 
 impl Default for Ollama {
@@ -20,7 +40,10 @@ impl Default for Ollama {
                 }
             })
             .unwrap_or_else(|| "http://localhost:11434".to_string());
-        Self { host }
+        Self {
+            host,
+            agent: new_agent(),
+        }
     }
 }
 
@@ -73,10 +96,11 @@ impl Provider for Ollama {
             "stream": true,
         });
 
-        let response = ureq::post(&url)
-            .timeout(Duration::from_secs(120))
+        let response = self
+            .agent
+            .post(&url)
             .send_json(body)
-            .map_err(|e| format!("chat request failed: {e}"))?;
+            .map_err(|e| chat_error(&url, e))?;
 
         let reader = BufReader::new(response.into_reader());
         let mut got_any = false;
@@ -104,5 +128,21 @@ impl Provider for Ollama {
             return Err("empty response from model".to_string());
         }
         Ok(())
+    }
+}
+
+/// Build a useful error string. For HTTP status errors, pull the server's
+/// `{"error": "..."}` message out of the body so the user sees the real cause.
+fn chat_error(url: &str, e: ureq::Error) -> String {
+    match e {
+        ureq::Error::Status(code, resp) => {
+            let detail = resp
+                .into_json::<serde_json::Value>()
+                .ok()
+                .and_then(|v| v["error"].as_str().map(str::to_string))
+                .unwrap_or_else(|| format!("status code {code}"));
+            format!("chat request failed: {url}: {detail}")
+        }
+        ureq::Error::Transport(t) => format!("chat request failed: {url}: {t}"),
     }
 }

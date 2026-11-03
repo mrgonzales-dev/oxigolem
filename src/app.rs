@@ -303,7 +303,11 @@ impl App {
                     {
                         self.transcript.pop();
                     }
-                    self.toast = Some(format!("chat error: {e}"));
+                    self.transcript.push(TranscriptEntry {
+                        role: Role::Tool,
+                        text: format!("chat error: {e}"),
+                    });
+                    self.toast = Some("chat failed — see transcript".to_string());
                 }
             }
         }
@@ -315,5 +319,11 @@ impl App {
             View::Agent => self.send_chat(),
             View::Output => self.run_command(),
         }
+    }
+}
+
+impl Default for App {
+    fn default() -> Self {
+        Self::new()
     }
 }
