@@ -1,5 +1,5 @@
 use ratatui::{
-    layout::{Alignment, Constraint, Flex, Layout, Rect},
+    layout::{Alignment, Rect},
     style::{Modifier, Style},
     text::Line,
     widgets::{Block, Borders, Clear, Paragraph},
@@ -10,12 +10,13 @@ use crate::theme::{BG, ORANGE, TEXT};
 
 pub fn draw(f: &mut Frame, area: Rect, msg: &str) {
     let width = (msg.len() as u16 + 4).min(area.width);
-    let [row] = Layout::vertical([Constraint::Length(3)])
-        .flex(Flex::Center)
-        .areas(area);
-    let [rect] = Layout::horizontal([Constraint::Length(width)])
-        .flex(Flex::Center)
-        .areas(row);
+    let h = 3u16;
+    let rect = Rect {
+        x: area.x + area.width.saturating_sub(width),
+        y: area.y + area.height.saturating_sub(h),
+        width,
+        height: h,
+    };
 
     f.render_widget(Clear, rect);
     let block = Block::default()
