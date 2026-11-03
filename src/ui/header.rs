@@ -43,24 +43,23 @@ pub fn draw(
         None => "not connected".to_string(),
     };
 
-    // Brand chip — glows/scrambles while connecting or generating so
-    // the user can see work is happening at a glance. Idle = static.
-    let chip_span = if chip.connecting {
-        chip_frame("connecting", chip.tick)
-    } else if chip.busy {
-        chip_frame("oxigolem", chip.tick)
+    // Brand chip — a soft shine sweeps left→right across the label
+    // while connecting or generating (Claude-Code style). The text
+    // itself never changes; only brightness moves. Idle = static.
+    let chip_label = if chip.connecting { "connecting" } else { "oxigolem" };
+    let mut spans: Vec<Span> = if chip.connecting || chip.busy {
+        chip_spans(chip_label, chip.tick)
     } else {
-        Span::styled(
+        vec![Span::styled(
             " oxigolem ",
             Style::default().fg(BG).bg(ORANGE).add_modifier(Modifier::BOLD),
-        )
+        )]
     };
 
-    let mut spans = vec![
-        chip_span,
+    spans.extend([
         Span::raw("  "),
         Span::styled(model_label, Style::default().fg(ORANGE)),
-    ];
+    ]);
 
     // Cache hit rate + generation speed from the last turn — hidden
     // until the first done chunk lands.
@@ -117,51 +116,45 @@ pub fn draw(
     f.render_widget(header, area);
 }
 
-/// Per-tick pseudo-random animation for the brand chip. Two sources of
-/// randomness, both deterministic on `tick`:
-///   - xorshift32 hash of the tick picks one of several style modes
-///   - a second hash picks a text variant (dots, brackets, caps, etc.)
-///
-/// The result is a fresh look every frame — color, background, text,
-/// modifiers all change. Idle uses the static chip so this only fires
-/// while work is actually happening.
-fn chip_frame(label: &str, tick: u64) -> Span<'static> {
-    // Advance one frame every ~3 ticks (~150 ms at 50 ms/tick) — fast
-    // enough to feel alive, slow enough each variant is readable.
-    let frame = tick / 3;
-    // xorshift32 — cheap deterministic hash, no rand crate needed.
-    let mut h = (frame as u32).wrapping_add(0x9e3779b9);
-    h ^= h << 13;
-    h ^= h >> 17;
-    h ^= h << 5;
-    let mode = (h % 8) as usize;
-    let h2 = h.wrapping_mul(0x85ebca6b) ^ (h >> 13);
-    let variant = (h2 % 8) as usize;
-
-    // Text variants — brackets, dots, stars, uppercase, spaced, etc.
-    let text: String = match variant {
-        0 => format!(" {} ", label),
-        1 => format!(" [{}] ", label),
-        2 => format!("  {}  ", label.to_uppercase()),
-        3 => format!(" ·{}· ", label),
-        4 => format!(" ✦ {} ✦ ", label),
-        5 => format!("  {}  ", label.chars().map(|c| format!("{c} ")).collect::<String>().trim_end()),
-        6 => format!(" ⟨{}⟩ ", label),
-        _ => format!(" {}… ", label),
+/// Claude-Code-style shine: the chip text is fixed — a bright spot
+/// sweeps left→right across it, dimming the chars behind it. One
+/// full sweep every ~48 ticks (~2.4 s at 50 ms/tick) with a brief
+/// settle at the end so it reads as a pulse, not a marquee.
+fn chip_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
+    const SWEEP: u64 = 40; // ticks for the shine to cross once
+    const PERIOD: u64 = 56; // sweep + rest
+    let text = format!(" {label} ");
+    let n = text.chars().count();
+    let t = tick % PERIOD;
+    // Sweep position in char-space, -2..n+2 so the blob enters from
+    // the left gutter and exits right before resting.
+    let pos = if t < SWEEP {
+        (t as f32 / SWEEP as f32) * (n as f32 + 4.0) - 2.0
+    } else {
+        -10.0 // resting — no highlight
     };
+    text.chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let d = (i as f32 - pos).abs();
+            // Gaussian falloff — wide soft crest, no hard edge.
+            let k = (-(d * d) / 6.0).exp();
+            let bg = mix_rgb(ORANGE, crate::theme::THINK_HOT, k);
+            Span::styled(
+                c.to_string(),
+                Style::default().fg(BG).bg(bg).add_modifier(Modifier::BOLD),
+            )
+        })
+        .collect()
+}
 
-    // Style modes — foreground/background combinations plus modifier
-    // flourishes (bold, italic, dim, reversed, underlined).
-    let style = match mode {
-        0 => Style::default().fg(BG).bg(ORANGE).add_modifier(Modifier::BOLD),
-        1 => Style::default().fg(ORANGE).add_modifier(Modifier::BOLD | Modifier::ITALIC),
-        2 => Style::default().fg(BG).bg(FAINT).add_modifier(Modifier::BOLD),
-        3 => Style::default().fg(ORANGE).add_modifier(Modifier::UNDERLINED | Modifier::BOLD),
-        4 => Style::default().fg(FAINT).bg(BG).add_modifier(Modifier::ITALIC),
-        5 => Style::default().fg(BG).bg(TEXT).add_modifier(Modifier::BOLD),
-        6 => Style::default().fg(ORANGE).add_modifier(Modifier::DIM | Modifier::ITALIC),
-        _ => Style::default().fg(BG).bg(ORANGE).add_modifier(Modifier::REVERSED | Modifier::BOLD),
+/// Linear blend between two `Color::Rgb` values. `k=0` keeps `a`,
+/// `k=1` gives `b`.
+fn mix_rgb(a: ratatui::style::Color, b: ratatui::style::Color, k: f32) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let (Color::Rgb(ar, ag, ab), Color::Rgb(br, bg_, bb)) = (a, b) else {
+        return a;
     };
-
-    Span::styled(text, style)
+    let m = |x: f32, y: f32| (x + (y - x) * k.clamp(0.0, 1.0)) as u8;
+    Color::Rgb(m(ar as f32, br as f32), m(ag as f32, bg_ as f32), m(ab as f32, bb as f32))
 }
