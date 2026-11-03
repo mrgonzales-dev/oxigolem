@@ -1002,3 +1002,64 @@ fn usage_event_reaches_app() {
     assert_eq!(u.prompt, 100);
     assert_eq!(u.cached, 99);
 }
+
+#[test]
+fn fenced_mode_recovers_bash_block_into_tool_call() {
+    // A model without native tools writes ```bash fenced text — the
+    // engine must execute it like a real call and continue the loop.
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(
+            vec![
+                vec![StreamChunk::Content(
+                    "Let me check:\n```bash\necho fenced-ok\n```".into(),
+                )],
+                vec![StreamChunk::Content("done after tool".into())],
+            ]
+            .into(),
+        ),
+    });
+    let mut engine = ChatEngine::new(provider, "m".into());
+    engine.set_fenced(true);
+    engine.send("run it".into()).unwrap();
+    let mut calls = 0;
+    let mut results = 0;
+    for _ in 0..200 {
+        for ev in engine.poll() {
+            match ev {
+                ChatEvent::ToolCall { name, .. } => {
+                    assert_eq!(name, "bash");
+                    calls += 1;
+                }
+                ChatEvent::ToolResult { outcome, .. } => {
+                    assert!(outcome.result.stdout.contains("fenced-ok"));
+                    results += 1;
+                }
+                ChatEvent::Done(_) | ChatEvent::Error(_) => {
+                    assert_eq!(calls, 1, "recovered call fired");
+                    assert_eq!(results, 1, "result delivered");
+                    return;
+                }
+                _ => {}
+            }
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("engine never finished");
+}
+
+#[test]
+fn fenced_mode_passes_plain_text_unchanged() {
+    // No fenced block, no JSON → no phantom tool call.
+    let provider = Arc::new(MockProvider::content(&["just an answer"]));
+    let mut engine = ChatEngine::new(provider, "m".into());
+    engine.set_fenced(true);
+    engine.send("hi".into()).unwrap();
+    for _ in 0..200 {
+        let done = engine.poll().iter().any(|e| matches!(e, ChatEvent::Done(_)));
+        if done {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("engine never finished");
+}

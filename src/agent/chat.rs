@@ -189,6 +189,7 @@ impl ChatEngine {
         let demote = Arc::clone(&self.demote);
         let cancel = Arc::clone(&self.cancel);
         let opts = self.opts.clone();
+        let fenced = self.fenced;
         // Budget: pick the plan once per send. KeepAll sends history
         // verbatim; Compact sends history[cut..] where `cut` is the
         // committed boundary from a previous send (or a fresh one
@@ -272,6 +273,18 @@ impl ChatEngine {
                         return Err("__cancelled__".to_string());
                     }
 
+                    // Fenced-mode repair: a model without native tool
+                    // support often writes ```bash blocks or bare JSON
+                    // instead of a real tool_call. Recover one from the
+                    // text and run it like a normal call — the model
+                    // never learns the difference.
+                    if fenced
+                        && calls.is_empty()
+                        && let Some(c) = super::repair::recover(&text, &["bash"])
+                    {
+                        calls.push(c);
+                    }
+
                     let mut assistant = Message::assistant(text);
                     if !calls.is_empty() {
                         assistant.tool_calls = Some(calls.clone());
@@ -287,8 +300,28 @@ impl ChatEngine {
                             name: call.name.clone(),
                             args: call.arguments.clone(),
                         });
-                        let outcome =
-                            tools::execute(&shell, &shells, &demote, &call.name, &call.arguments);
+                        // catch_unwind: a tool panic must not take the
+                        // agent thread down — synthesize an error
+                        // outcome so the loop keeps going.
+                        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            tools::execute(&shell, &shells, &demote, &call.name, &call.arguments)
+                        }))
+                        .unwrap_or_else(|_| tools::ToolOutcome {
+                            command: call.arguments["command"]
+                                .as_str()
+                                .unwrap_or("")
+                                .to_string(),
+                            result: crate::shell::ShellResult {
+                                stdout: String::new(),
+                                stderr: String::new(),
+                                code: None,
+                                duration: std::time::Duration::ZERO,
+                                timed_out: false,
+                                error: Some("error: tool panicked".to_string()),
+                            },
+                            spilled: None,
+                            demoted: false,
+                        });
                         let text = outcome.to_tool_message();
                         let _ = tx.send(ChatEvent::ToolResult {
                             name: call.name.clone(),
