@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use super::{Provider, StreamChunk};
 use crate::chat::Message;
+use crate::tools::{self, ToolSpec};
 
 pub struct Ollama {
     host: String,
@@ -81,20 +82,45 @@ impl Provider for Ollama {
         &self,
         model: &str,
         messages: &[Message],
+        tools: &[ToolSpec],
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
 
         let messages_json: Vec<serde_json::Value> = messages
             .iter()
-            .map(|m| serde_json::json!({ "role": m.role, "content": m.content }))
+            .map(|m| {
+                let mut v = serde_json::json!({ "role": m.role, "content": m.content });
+                if let Some(calls) = &m.tool_calls {
+                    v["tool_calls"] = serde_json::Value::Array(
+                        calls
+                            .iter()
+                            .map(|c| {
+                                serde_json::json!({
+                                    "function": {
+                                        "name": c.name,
+                                        "arguments": c.arguments,
+                                    }
+                                })
+                            })
+                            .collect(),
+                    );
+                }
+                if let Some(name) = &m.name {
+                    v["name"] = serde_json::Value::String(name.clone());
+                }
+                v
+            })
             .collect();
 
-        let body = serde_json::json!({
+        let mut body = serde_json::json!({
             "model": model,
             "messages": messages_json,
             "stream": true,
         });
+        if !tools.is_empty() {
+            body["tools"] = tools::to_json(tools);
+        }
 
         let response = self
             .agent
@@ -132,6 +158,27 @@ impl Provider for Ollama {
                 let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
                     continue; // skip partial/garbled line
                 };
+                // Tool calls can arrive on the same chunk as done:true —
+                // parse them BEFORE the done check or they're dropped.
+                if let Some(calls) = v["message"]["tool_calls"].as_array() {
+                    for c in calls {
+                        let name = c["function"]["name"].as_str().unwrap_or("").to_string();
+                        // Ollama emits arguments as an object, but some
+                        // models send a JSON *string* — parse it back.
+                        let args = match &c["function"]["arguments"] {
+                            serde_json::Value::String(s) => {
+                                serde_json::from_str(s).unwrap_or(serde_json::json!({}))
+                            }
+                            serde_json::Value::Null => serde_json::json!({}),
+                            other => other.clone(),
+                        };
+                        got_any = true;
+                        on_chunk(StreamChunk::ToolCall {
+                            name,
+                            arguments: args,
+                        });
+                    }
+                }
                 if v["done"].as_bool() == Some(true) {
                     finished = true;
                     break;

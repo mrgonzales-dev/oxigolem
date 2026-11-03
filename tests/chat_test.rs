@@ -2,7 +2,9 @@ use oxigolem::app::{App, Role};
 use oxigolem::chat::{ChatEngine, ChatEvent, Message};
 use oxigolem::provider::ollama::Ollama;
 use oxigolem::provider::{Provider, StreamChunk};
+use oxigolem::tools::ToolSpec;
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
@@ -39,10 +41,43 @@ impl Provider for MockProvider {
         &self,
         _model: &str,
         _messages: &[Message],
+        _tools: &[ToolSpec],
         on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         for c in self.chunks.lock().unwrap().iter() {
             on_chunk(c.clone());
+        }
+        Ok(())
+    }
+}
+
+/// A scripted provider: each call to chat() pops the next turn of chunks.
+struct ScriptedProvider {
+    turns: Mutex<VecDeque<Vec<StreamChunk>>>,
+}
+
+impl Provider for ScriptedProvider {
+    fn name(&self) -> &'static str {
+        "scripted"
+    }
+    fn list_models(&self) -> Result<Vec<String>, String> {
+        Ok(vec!["m".to_string()])
+    }
+    fn chat(
+        &self,
+        _model: &str,
+        _messages: &[Message],
+        _tools: &[ToolSpec],
+        on_chunk: &dyn Fn(StreamChunk),
+    ) -> Result<(), String> {
+        let turn = self
+            .turns
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or_else(|| vec![StreamChunk::Content("done".to_string())]);
+        for c in turn {
+            on_chunk(c);
         }
         Ok(())
     }
@@ -70,12 +105,12 @@ fn chat_engine_streams_tokens_and_finishes() {
         .collect();
 
     assert_eq!(tokens, vec!["Hello", " world"]);
-    assert!(events.iter().any(|e| matches!(e, ChatEvent::Done)));
+    assert!(events.iter().any(|e| matches!(e, ChatEvent::Done(_))));
     assert!(!engine.is_busy());
 }
 
 #[test]
-fn chat_engine_records_assistant_message() {
+fn chat_engine_records_appended_messages_on_done() {
     let provider = Arc::new(MockProvider::content(&["response"]));
     let mut engine = ChatEngine::new(provider, "mock-model".to_string());
 
@@ -83,10 +118,13 @@ fn chat_engine_records_assistant_message() {
     std::thread::sleep(std::time::Duration::from_millis(100));
 
     let events = engine.poll();
-    assert!(events.iter().any(|e| matches!(e, ChatEvent::Token(_))));
-    assert!(events.iter().any(|e| matches!(e, ChatEvent::Done)));
+    let appended = events.iter().find_map(|e| match e {
+        ChatEvent::Done(msgs) => Some(msgs.clone()),
+        _ => None,
+    });
+    let appended = appended.expect("Done should carry appended messages");
+    engine.record_appended(appended);
 
-    engine.record_assistant("response".to_string());
     assert_eq!(engine.history().len(), 2);
     assert_eq!(engine.history()[0].role, "user");
     assert_eq!(engine.history()[0].content, "question");
@@ -121,6 +159,7 @@ fn chat_engine_propagates_error() {
             &self,
             _model: &str,
             _messages: &[Message],
+            _tools: &[ToolSpec],
             _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("provider failed".to_string())
@@ -138,6 +177,83 @@ fn chat_engine_propagates_error() {
         ChatEvent::Error(e) => e.contains("provider failed"),
         _ => false,
     }));
+    assert!(!engine.is_busy());
+}
+
+#[test]
+fn engine_executes_tool_call_and_continues() {
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(VecDeque::from(vec![
+            vec![StreamChunk::ToolCall {
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "echo from-tool"}),
+            }],
+            vec![StreamChunk::Content("the answer".to_string())],
+        ])),
+    });
+    let mut engine = ChatEngine::new(provider, "m".to_string());
+    engine.send("run something".to_string()).unwrap();
+    std::thread::sleep(Duration::from_millis(200));
+    let events = engine.poll();
+
+    // Tool call + result events surfaced.
+    assert!(events.iter().any(|e| matches!(e, ChatEvent::ToolCall { name, .. } if name == "bash")));
+    let result = events.iter().find_map(|e| match e {
+        ChatEvent::ToolResult { output, .. } => Some(output.clone()),
+        _ => None,
+    });
+    assert!(
+        result.as_deref().is_some_and(|o| o.contains("from-tool")),
+        "tool output should reach the event stream, events: {events:?}"
+    );
+
+    // History: user + assistant(tool_calls) + tool + assistant(reply).
+    let appended = events.iter().find_map(|e| match e {
+        ChatEvent::Done(msgs) => Some(msgs.clone()),
+        _ => None,
+    });
+    engine.record_appended(appended.expect("Done"));
+    let roles: Vec<&str> = engine.history().iter().map(|m| m.role.as_str()).collect();
+    assert_eq!(roles, vec!["user", "assistant", "tool", "assistant"]);
+    assert!(engine.history()[1].tool_calls.is_some());
+    assert_eq!(engine.history()[2].content.trim(), "from-tool");
+    assert_eq!(engine.history()[3].content, "the answer");
+}
+
+#[test]
+fn engine_stops_at_iteration_cap() {
+    // Provider always returns a tool call — the loop must not run forever.
+    struct AlwaysTool;
+    impl Provider for AlwaysTool {
+        fn name(&self) -> &'static str {
+            "always"
+        }
+        fn list_models(&self) -> Result<Vec<String>, String> {
+            Ok(vec![])
+        }
+        fn chat(
+            &self,
+            _m: &str,
+            _msgs: &[Message],
+            _tools: &[ToolSpec],
+            on_chunk: &dyn Fn(StreamChunk),
+        ) -> Result<(), String> {
+            on_chunk(StreamChunk::ToolCall {
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "true"}),
+            });
+            Ok(())
+        }
+    }
+    let mut engine = ChatEngine::new(Arc::new(AlwaysTool), "m".to_string());
+    engine.send("loop".to_string()).unwrap();
+    // Generous wait; loop of 8 should finish quickly.
+    std::thread::sleep(Duration::from_millis(2000));
+    let events = engine.poll();
+    assert!(
+        events.iter().any(|e| matches!(e, ChatEvent::Done(_) | ChatEvent::Error(_))),
+        "engine must terminate at the iteration cap"
+    );
     assert!(!engine.is_busy());
 }
 
@@ -160,6 +276,34 @@ fn fake_ollama(
     format!("http://127.0.0.1:{port}")
 }
 
+fn test_messages() -> Vec<Message> {
+    vec![Message::user("hi")]
+}
+
+/// Read a full HTTP request: headers until \r\n\r\n, then body per
+/// Content-Length. A single `read()` often returns headers only.
+fn read_request(stream: &mut std::net::TcpStream) -> String {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        let n = stream.read(&mut chunk).unwrap();
+        buf.extend_from_slice(&chunk[..n]);
+        let s = String::from_utf8_lossy(&buf).to_string();
+        if let Some(pos) = s.find("\r\n\r\n") {
+            let want = s[..pos]
+                .to_lowercase()
+                .split("content-length:")
+                .nth(1)
+                .and_then(|v| v.lines().next())
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(0);
+            if s.len() - (pos + 4) >= want {
+                return s;
+            }
+        }
+    }
+}
+
 #[test]
 fn ollama_chat_streams_tokens() {
     let host = fake_ollama(|stream| {
@@ -177,7 +321,7 @@ fn ollama_chat_streams_tokens() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+        .chat("m", &test_messages(), &[], &|c| {
             tokens.borrow_mut().push(c)
         })
         .unwrap();
@@ -188,6 +332,130 @@ fn ollama_chat_streams_tokens() {
             StreamChunk::Content(" world".into())
         ]
     );
+}
+
+#[test]
+fn ollama_sends_tools_in_request() {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<String>();
+    // fake_ollama discards the request, so use a raw listener that captures it.
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let req = read_request(&mut stream);
+        let body = "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        tx.send(req).unwrap();
+    });
+    let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
+    provider
+        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|_| {})
+        .unwrap();
+    let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let json_start = req.find('{').unwrap();
+    let v: serde_json::Value = serde_json::from_str(&req[json_start..]).unwrap();
+    assert_eq!(v["tools"][0]["function"]["name"], "bash", "req: {req}");
+}
+
+#[test]
+fn ollama_parses_tool_calls_chunk() {
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":{\"command\":\"ls\"}}}]}}\n\
+                    {\"done\":true}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+    let provider = Ollama::new(host);
+    let chunks = RefCell::new(Vec::new());
+    provider
+        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|c| {
+            chunks.borrow_mut().push(c)
+        })
+        .unwrap();
+    assert_eq!(
+        *chunks.borrow(),
+        vec![StreamChunk::ToolCall {
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }]
+    );
+}
+
+#[test]
+fn ollama_parses_tool_calls_on_done_chunk() {
+    // Ollama can emit tool_calls in the same chunk that has done:true.
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"tool_calls\":[{\"function\":{\"name\":\"bash\",\"arguments\":{\"command\":\"pwd\"}}}]},\"done\":true}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+    let provider = Ollama::new(host);
+    let chunks = RefCell::new(Vec::new());
+    provider
+        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|c| {
+            chunks.borrow_mut().push(c)
+        })
+        .unwrap();
+    assert_eq!(
+        *chunks.borrow(),
+        vec![StreamChunk::ToolCall {
+            name: "bash".to_string(),
+            arguments: serde_json::json!({"command": "pwd"}),
+        }]
+    );
+}
+
+#[test]
+fn ollama_serializes_tool_messages_back() {
+    use std::sync::mpsc;
+    let (tx, rx) = mpsc::channel::<String>();
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        let req = read_request(&mut stream);
+        let body = "{\"message\":{\"content\":\"ok\"}}\n{\"done\":true}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        tx.send(req).unwrap();
+    });
+    let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
+    let mut assistant = Message::assistant("".to_string());
+    assistant.tool_calls = Some(vec![oxigolem::chat::ToolCall {
+        name: "bash".to_string(),
+        arguments: serde_json::json!({"command": "ls"}),
+    }]);
+    let msgs = vec![
+        Message::user("run ls"),
+        assistant,
+        Message::tool("bash", "file.rs"),
+    ];
+    provider.chat("m", &msgs, &[], &|_| {}).unwrap();
+    let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let json_start = req.find('{').unwrap();
+    let v: serde_json::Value = serde_json::from_str(&req[json_start..]).unwrap();
+    assert_eq!(v["messages"][1]["tool_calls"][0]["function"]["name"], "bash");
+    assert_eq!(v["messages"][2]["role"], "tool");
+    assert_eq!(v["messages"][2]["name"], "bash");
+    assert_eq!(v["messages"][2]["content"], "file.rs");
 }
 
 #[test]
@@ -216,7 +484,7 @@ fn ollama_chat_no_total_stream_timeout() {
     let tokens = RefCell::new(Vec::new());
     let start = std::time::Instant::now();
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+        .chat("m", &test_messages(), &[], &|c| {
             tokens.borrow_mut().push(c)
         })
         .unwrap();
@@ -245,7 +513,7 @@ fn ollama_chat_error_surfaces_server_message() {
 
     let provider = Ollama::new(host);
     let err = provider
-        .chat("x", &[Message { role: "user".into(), content: "hi".into() }], &|_| {})
+        .chat("x", &test_messages(), &[], &|_| {})
         .unwrap_err();
     assert!(
         err.contains("model 'x' not found"),
@@ -274,7 +542,8 @@ fn ollama_chat_tolerates_abrupt_close_mid_stream() {
     let tokens = RefCell::new(Vec::new());
     let res = provider.chat(
         "m",
-        &[Message { role: "user".into(), content: "hi".into() }],
+        &test_messages(),
+        &[],
         &|c| tokens.borrow_mut().push(c),
     );
     assert!(res.is_ok(), "expected Ok, got {res:?}");
@@ -303,7 +572,7 @@ fn ollama_chat_surfaces_thinking() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+        .chat("m", &test_messages(), &[], &|c| {
             tokens.borrow_mut().push(c)
         })
         .unwrap();
@@ -342,6 +611,37 @@ fn app_thinking_and_reply_are_separate_entries() {
 }
 
 #[test]
+fn app_tool_events_render_as_tool_entries() {
+    let provider = Arc::new(ScriptedProvider {
+        turns: Mutex::new(VecDeque::from(vec![
+            vec![StreamChunk::ToolCall {
+                name: "bash".to_string(),
+                arguments: serde_json::json!({"command": "echo hi"}),
+            }],
+            vec![StreamChunk::Content("done answer".to_string())],
+        ])),
+    });
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(provider, "m".into()));
+    app.transcript.push(oxigolem::app::TranscriptEntry {
+        role: Role::User,
+        text: "run it".into(),
+    });
+    app.chat.as_mut().unwrap().send("run it".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(300));
+    app.poll_chat();
+
+    let roles: Vec<Role> = app.transcript.iter().map(|e| e.role).collect();
+    assert_eq!(
+        roles,
+        vec![Role::User, Role::Tool, Role::Tool, Role::Golem],
+        "transcript roles: {roles:?}"
+    );
+    assert_eq!(app.transcript[1].text, "$ echo hi");
+    assert!(app.transcript[2].text.contains("hi"));
+}
+
+#[test]
 fn app_chat_error_goes_to_transcript() {
     struct ErrorProvider;
     impl Provider for ErrorProvider {
@@ -355,6 +655,7 @@ fn app_chat_error_goes_to_transcript() {
             &self,
             _model: &str,
             _messages: &[Message],
+            _tools: &[ToolSpec],
             _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("chat request failed: http://localhost:11434/api/chat: connection refused".into())

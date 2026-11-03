@@ -1,4 +1,3 @@
-use std::process::Command;
 use std::sync::Arc;
 
 use crossterm::event::KeyCode;
@@ -7,6 +6,7 @@ use crate::{
     chat::{ChatEngine, ChatEvent},
     modal::{Connection, Kind, Modal},
     provider::{self, Provider},
+    shell::Shell,
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -48,6 +48,9 @@ pub struct App {
     pub transcript: Vec<TranscriptEntry>,
     providers: Vec<Arc<dyn Provider>>,
     pub chat: Option<ChatEngine>,
+    /// Shared terminal: user commands in Output view and the agent's
+    /// `bash` tool run in the same working directory.
+    pub shell: Shell,
     /// Frame counter for animations — bumps every loop tick.
     pub tick: u64,
     /// Manual scrollback offset (visual rows up from the bottom).
@@ -71,6 +74,7 @@ impl App {
             transcript: Vec::new(),
             providers: provider::registry(),
             chat: None,
+            shell: Shell::new(),
             tick: 0,
             scroll_back: None,
             gen_done_tick: None,
@@ -181,7 +185,7 @@ impl App {
                     provider: self.providers[provider].name(),
                     model: choice.clone(),
                 });
-                self.chat = Some(ChatEngine::new(p, choice));
+                self.chat = Some(ChatEngine::with_shell(p, choice, self.shell.clone()));
                 None
             }
             Kind::Message(_) => None,
@@ -256,24 +260,10 @@ impl App {
             return;
         }
 
-        let out = Command::new("bash").arg("-c").arg(&cmd).output();
-
-        match out {
-            Ok(o) => {
-                let stdout = String::from_utf8_lossy(&o.stdout);
-                let stderr = String::from_utf8_lossy(&o.stderr);
-                for line in stdout.lines() {
-                    self.term_lines.push(line.to_string());
-                }
-                for line in stderr.lines() {
-                    self.term_lines.push(format!("! {line}"));
-                }
-                let code = o.status.code().unwrap_or(-1);
-                if code != 0 {
-                    self.term_lines.push(format!("exit {code}"));
-                }
-            }
-            Err(e) => self.term_lines.push(format!("spawn failed: {e}")),
+        // Shared shell — a `cd` here also moves the agent's bash tool.
+        let out = self.shell.run(&cmd);
+        for line in out.lines() {
+            self.term_lines.push(line.to_string());
         }
     }
 
@@ -321,19 +311,30 @@ impl App {
                     }
                     Self::append_or_push(&mut self.transcript, Role::Golem, token);
                 }
-                ChatEvent::Done => {
-                    let text = self
-                        .transcript
-                        .iter()
-                        .rev()
-                        .take_while(|e| matches!(e.role, Role::Golem | Role::Thinking))
-                        .filter(|e| matches!(e.role, Role::Golem))
-                        .map(|e| e.text.clone())
-                        .collect::<Vec<_>>()
-                        .into_iter()
-                        .rev()
-                        .collect();
-                    engine.record_assistant(text);
+                ChatEvent::ToolCall { name, args } => {
+                    // bash calls render as `⎿ $ <command>` — the same
+                    // shape as a line the user typed themselves.
+                    let text = if name == "bash" {
+                        match args["command"].as_str() {
+                            Some(c) => format!("$ {c}"),
+                            None => format!("$ bash (bad args: {args})"),
+                        }
+                    } else {
+                        format!("{name} {args}")
+                    };
+                    self.transcript.push(TranscriptEntry {
+                        role: Role::Tool,
+                        text,
+                    });
+                }
+                ChatEvent::ToolResult { output, .. } => {
+                    self.transcript.push(TranscriptEntry {
+                        role: Role::Tool,
+                        text: output,
+                    });
+                }
+                ChatEvent::Done(msgs) => {
+                    engine.record_appended(msgs);
                     // Don't re-stamp — the thinking→reply transition
                     // already started the fade; a fresh stamp would
                     // re-light the thinking block at end of generation.
