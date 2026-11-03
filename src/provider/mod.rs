@@ -2,8 +2,8 @@ pub mod ollama;
 
 use std::sync::Arc;
 
-use crate::chat::Message;
-use crate::tools::ToolSpec;
+use crate::agent::chat::Message;
+use crate::agent::tools::ToolSpec;
 
 /// A piece of a streamed reply: the visible answer, the model's reasoning,
 /// or a request to run a tool.

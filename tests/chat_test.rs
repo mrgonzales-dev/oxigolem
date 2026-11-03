@@ -1,8 +1,8 @@
+use oxigolem::agent::chat::{ChatEngine, ChatEvent, Message};
+use oxigolem::agent::tools::ToolSpec;
 use oxigolem::app::{App, Role};
-use oxigolem::chat::{ChatEngine, ChatEvent, Message};
 use oxigolem::provider::ollama::Ollama;
 use oxigolem::provider::{Provider, StreamChunk};
-use oxigolem::tools::ToolSpec;
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{Read, Write};
@@ -355,7 +355,7 @@ fn ollama_sends_tools_in_request() {
     });
     let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
     provider
-        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|_| {})
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|_| {})
         .unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let json_start = req.find('{').unwrap();
@@ -378,7 +378,7 @@ fn ollama_parses_tool_calls_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|c| {
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
             chunks.borrow_mut().push(c)
         })
         .unwrap();
@@ -406,7 +406,7 @@ fn ollama_parses_tool_calls_on_done_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::tools::specs(), &|c| {
+        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
             chunks.borrow_mut().push(c)
         })
         .unwrap();
@@ -439,7 +439,7 @@ fn ollama_serializes_tool_messages_back() {
     });
     let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
     let mut assistant = Message::assistant("".to_string());
-    assistant.tool_calls = Some(vec![oxigolem::chat::ToolCall {
+    assistant.tool_calls = Some(vec![oxigolem::agent::chat::ToolCall {
         name: "bash".to_string(),
         arguments: serde_json::json!({"command": "ls"}),
     }]);

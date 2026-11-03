@@ -3,7 +3,7 @@ use std::sync::Arc;
 use crossterm::event::KeyCode;
 
 use crate::{
-    chat::{ChatEngine, ChatEvent},
+    agent::chat::{ChatEngine, ChatEvent},
     modal::{Connection, Kind, Modal},
     provider::{self, Provider},
     shell::Shell,

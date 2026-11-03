@@ -1,5 +1,6 @@
 use crate::shell::Shell;
 
+
 /// One callable tool, described in the Ollama `tools` request format.
 pub struct ToolSpec {
     pub name: &'static str,

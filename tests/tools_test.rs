@@ -1,5 +1,5 @@
 use oxigolem::shell::Shell;
-use oxigolem::tools;
+use oxigolem::agent::tools;
 
 #[test]
 fn bash_runs_command_and_captures_stdout() {

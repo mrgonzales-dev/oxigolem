@@ -2,10 +2,9 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 
+use super::{systemprompt::system_prompt, tools};
 use crate::provider::{Provider, StreamChunk};
 use crate::shell::Shell;
-use crate::systemprompt::system_prompt;
-use crate::tools;
 
 /// A tool call requested by the model (Ollama `message.tool_calls` shape).
 #[derive(Clone, Debug, PartialEq)]
@@ -124,7 +123,7 @@ impl ChatEngine {
         let model = self.model.clone();
         let shell = self.shell.clone();
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
-        msgs.push(Message::system(system_prompt()));
+        msgs.push(Message::system(&system_prompt()));
         msgs.extend(self.history.iter().cloned());
 
         thread::spawn(move || {

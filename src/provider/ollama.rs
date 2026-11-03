@@ -2,8 +2,8 @@ use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
 use super::{Provider, StreamChunk};
-use crate::chat::Message;
-use crate::tools::{self, ToolSpec};
+use crate::agent::chat::Message;
+use crate::agent::tools::{self, ToolSpec};
 
 pub struct Ollama {
     host: String,

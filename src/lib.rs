@@ -1,9 +1,7 @@
+pub mod agent;
 pub mod app;
-pub mod chat;
 pub mod modal;
 pub mod provider;
 pub mod shell;
-pub mod systemprompt;
 pub mod theme;
-pub mod tools;
 pub mod ui;
