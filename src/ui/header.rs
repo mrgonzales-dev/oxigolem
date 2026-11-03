@@ -63,11 +63,16 @@ pub fn draw(
         )]
     };
 
-    spans.extend([
-        Span::raw("  "),
-        Span::styled(model_label, Style::default().fg(ORANGE)),
-    ]);
-
+    // Model label — connected: an iridescent hue shimmer rolls through
+    // it (per-char hue offset + slow drift — colors travel left→right
+    // and cycle over time, no more stale orange). Disconnected: static
+    // faint — a rainbow on a dead model lies about connection health.
+    spans.push(Span::raw("  "));
+    if connected.is_some() {
+        spans.extend(model_spans(&model_label, chip.tick));
+    } else {
+        spans.push(Span::styled(model_label, Style::default().fg(FAINT)));
+    }
     // Cache hit rate + generation speed from the last turn — hidden
     // until the first done chunk lands.
     if let Some(u) = usage {
@@ -132,11 +137,13 @@ pub fn draw(
 
 /// Claude-Code-style shine: the chip text is fixed — a bright spot
 /// sweeps left→right across it, dimming the chars behind it. One
-/// full sweep every ~48 ticks (~2.4 s at 50 ms/tick) with a brief
+/// full sweep every ~28 ticks (~1.4 s at 50 ms/tick) with a brief
 /// settle at the end so it reads as a pulse, not a marquee.
+/// Sped up from 40/56 — 2.4 s read as a crawl next to the 4.8 s
+/// thinking shimmer.
 fn chip_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
-    const SWEEP: u64 = 40; // ticks for the shine to cross once
-    const PERIOD: u64 = 56; // sweep + rest
+    const SWEEP: u64 = 28; // ticks for the shine to cross once
+    const PERIOD: u64 = 40; // sweep + rest
     let text = format!(" {label} ");
     let n = text.chars().count();
     let t = tick % PERIOD;
@@ -158,6 +165,56 @@ fn chip_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
                 c.to_string(),
                 Style::default().fg(BG).bg(bg).add_modifier(Modifier::BOLD),
             )
+        })
+        .collect()
+}
+
+/// Model-label shimmer — per-char hue: char `col` sees hue
+/// `(2°/tick) + 8°` of column offset, so a rainbow wave drifts
+/// left→right across the label and every char keeps cycling. Full
+/// cycle per char ≈ 9 s; neighbor chars sit 8° apart. Saturation and
+/// value are held constant so it shimmers in hue only — reads as
+/// iridescence, not flashing.
+pub fn model_shimmer_hue(col: usize, tick: u64) -> f32 {
+    // f64 keeps tick*2° exact to flyweight precision; the label sits
+    // on a dark bg at fixed s/v, so wraparound is the only seam.
+    let h = (tick as f64) * 2.0 + (col as f64) * 8.0;
+    (h % 360.0) as f32
+}
+
+/// HSV → `ratatui` RGB. `h` in degrees (any value; wrapped mod 360),
+/// `s`/`v` clamped 0..1. Standard formula, exact primaries at s=1/v=1.
+pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> ratatui::style::Color {
+    use ratatui::style::Color;
+    let s = s.clamp(0.0, 1.0);
+    let v = v.clamp(0.0, 1.0);
+    let h = ((h % 360.0 + 360.0) % 360.0) / 60.0;
+    let c = v * s;
+    let x = c * (1.0 - (h % 2.0 - 1.0).abs());
+    let m = v - c;
+    let (r, g, b) = match h as u8 {
+        0 => (c, x, 0.0),
+        1 => (x, c, 0.0),
+        2 => (0.0, c, x),
+        3 => (0.0, x, c),
+        4 => (x, 0.0, c),
+        _ => (c, 0.0, x),
+    };
+    let f = |k: f32| ((k + m) * 255.0 + 0.5) as u8;
+    Color::Rgb(f(r), f(g), f(b))
+}
+
+/// The shimmer itself: one span per char, hue from
+/// [`model_shimmer_hue`], s/v pinned so only hue moves.
+fn model_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
+    const SAT: f32 = 0.62;
+    const VAL: f32 = 0.82;
+    label
+        .chars()
+        .enumerate()
+        .map(|(i, c)| {
+            let color = hsv_to_rgb(model_shimmer_hue(i, tick), SAT, VAL);
+            Span::styled(c.to_string(), Style::default().fg(color))
         })
         .collect()
 }
