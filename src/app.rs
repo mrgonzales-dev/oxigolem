@@ -158,6 +158,12 @@ impl App {
         self.chat.as_ref().is_some_and(|c| c.is_busy())
     }
 
+    /// True while a model-list fetch is in flight — the connect flow
+    /// runs it on a worker thread and `poll_models` drains the result.
+    pub fn connecting(&self) -> bool {
+        self.models_rx.is_some()
+    }
+
     pub fn open_palette(&mut self) {
         self.modal = Some(Modal::new(Kind::Palette));
     }

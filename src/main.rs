@@ -166,7 +166,19 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         app.tick,
         App::slash_cmd_prefix_len(&app.input_display()),
     );
-    ui::header::draw(f, root[2], app.view, app.connected.as_ref(), &app.shells, app.last_usage.as_ref());
+    ui::header::draw(
+        f,
+        root[2],
+        app.view,
+        app.connected.as_ref(),
+        &app.shells,
+        app.last_usage.as_ref(),
+        ui::header::ChipState {
+            busy: app.chat_busy(),
+            connecting: app.connecting(),
+            tick: app.tick,
+        },
+    );
 
     if let Some(m) = &app.modal {
         ui::modal::draw(f, area, m, &app.modal_items());
