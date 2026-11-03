@@ -1,4 +1,4 @@
-use crate::shell::{Shell, ShellResult};
+use crate::shell::{BgShells, Shell, ShellResult};
 
 /// One callable tool, described in the Ollama `tools` request format.
 pub struct ToolSpec {
@@ -14,13 +14,20 @@ pub fn specs() -> Vec<ToolSpec> {
         name: "bash",
         description: "Run a bash command on the user's Linux machine. \
                       Shares one shell session with the user — working \
-                      directory and side effects persist.",
+                      directory and side effects persist. Set \
+                      run_in_background for long-running processes \
+                      (servers, watchers): it returns immediately with \
+                      a shell id and log path you can poll.",
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "command": {
                     "type": "string",
                     "description": "the bash command to run"
+                },
+                "run_in_background": {
+                    "type": "boolean",
+                    "description": "run detached and return immediately with a shell id + log path"
                 }
             },
             "required": ["command"]
@@ -137,63 +144,161 @@ fn spill_output(result: &ShellResult) -> Option<String> {
     Some(path)
 }
 
-/// Where spilled outputs live: `$OXIGOLEM_JOBS_DIR` override (tests),
-/// else `~/.cache/oxigolem/jobs`.
-fn jobs_dir() -> Option<String> {
-    if let Ok(d) = std::env::var("OXIGOLEM_JOBS_DIR") {
-        return Some(d);
-    }
-    let home = std::env::var("HOME").ok()?;
-    Some(format!("{home}/.cache/oxigolem/jobs"))
+/// Launch-time project dir set by `App::new` — spill files land in
+/// `<launch-cwd>/.oxigolem/jobs` so they stay with the project the
+/// session was opened in (independent of the shared shell's cwd).
+static PROJECT_JOBS_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+/// Capture the project jobs dir once, at app start. Creates the folder
+/// eagerly so it exists even if no tool ever spills.
+pub fn init_project_jobs_dir(launch_cwd: &std::path::Path) {
+    let dir = launch_cwd.join(".oxigolem").join("jobs");
+    let _ = std::fs::create_dir_all(&dir);
+    let _ = PROJECT_JOBS_DIR.set(dir.to_string_lossy().into_owned());
 }
 
-/// Run a tool call and return its structured outcome. Unknown tools or a
-/// missing `command` still produce an outcome — tagged `error` so the UI
-/// can render the failure the same way as a failed exit code.
-pub fn execute(shell: &Shell, name: &str, args: &serde_json::Value) -> ToolOutcome {
-    match name {
-        "bash" => {
-            let cmd = args["command"].as_str().unwrap_or("").to_string();
-            let result = if cmd.is_empty() {
-                ShellResult {
-                    stdout: String::new(),
-                    stderr: String::new(),
-                    code: None,
-                    duration: std::time::Duration::ZERO,
-                    timed_out: false,
-                    error: Some("error: bash call missing 'command' argument".to_string()),
-                }
-            } else {
-                shell.run_result(&cmd)
-            };
-            // Big outputs go to disk now — the model gets the path +
-            // preview via `to_tool_message`, and can grep the file for
-            // the rest. Errors/timeouts have nothing worth spilling.
-            let spilled = if result.error.is_none()
-                && !result.timed_out
-                && result.stdout.len() + result.stderr.len() > INLINE_CAP
-            {
-                spill_output(&result)
-            } else {
-                None
-            };
-            ToolOutcome {
-                command: cmd,
-                result,
-                spilled,
-            }
-        }
-        other => ToolOutcome {
-            command: String::new(),
+/// Where spilled outputs + bg-shell logs live: `$OXIGOLEM_JOBS_DIR`
+/// override (tests), else the project `.oxigolem/jobs` when
+/// `init_project_jobs_dir` ran, else a unique tmp dir per process —
+/// keeps parallel test runs from colliding on `sh1.log`.
+pub fn jobs_dir_path() -> Option<std::path::PathBuf> {
+    if let Ok(d) = std::env::var("OXIGOLEM_JOBS_DIR") {
+        return Some(d.into());
+    }
+    if let Some(d) = PROJECT_JOBS_DIR.get() {
+        return Some(d.clone().into());
+    }
+    // Per-process fallback under the system temp dir so concurrent
+    // test binaries can't clobber each other's `shN.log`.
+    static FALLBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    let dir = FALLBACK.get_or_init(|| {
+        let p = std::env::temp_dir().join(format!("oxigolem-jobs-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&p);
+        p.to_string_lossy().into_owned()
+    });
+    Some(dir.clone().into())
+}
+
+fn jobs_dir() -> Option<String> {
+    jobs_dir_path().map(|p| p.to_string_lossy().into_owned())
+}
+
+/// Every bash call — foreground or `run_in_background` — spawns through
+/// `Shell::spawn_bg` so the process lives in the shared registry while
+/// it runs (a shell tab appears live). Foreground shells are marked
+/// transient and removed once the result is read; a demote (Ctrl+B×2,
+/// which sets `demote`) clears the flag so the shell stays running as
+/// a normal background tab.
+///
+/// Unknown tools or a missing `command` still produce an outcome —
+/// tagged `error` so the UI renders the failure like a failed exit.
+pub fn execute(
+    shell: &Shell,
+    shells: &BgShells,
+    demote: &std::sync::atomic::AtomicBool,
+    name: &str,
+    args: &serde_json::Value,
+) -> ToolOutcome {
+    fn err(command: String, msg: String) -> ToolOutcome {
+        ToolOutcome {
+            command,
             result: ShellResult {
                 stdout: String::new(),
                 stderr: String::new(),
                 code: None,
                 duration: std::time::Duration::ZERO,
                 timed_out: false,
-                error: Some(format!("error: unknown tool '{other}'")),
+                error: Some(msg),
             },
             spilled: None,
-        },
+        }
+    }
+
+    match name {
+        "bash" => {
+            let cmd = args["command"].as_str().unwrap_or("").to_string();
+            if cmd.is_empty() {
+                return err(
+                    cmd,
+                    "error: bash call missing 'command' argument".to_string(),
+                );
+            }
+            let Some(jobs) = jobs_dir_path() else {
+                return err(cmd, "error: no jobs dir available".to_string());
+            };
+            let bg = args["run_in_background"].as_bool().unwrap_or(false);
+
+            // Ids come from a process-wide counter — `sh1`, `sh2`, …
+            // — so concurrent execute calls can never collide on a
+            // filename in a shared jobs dir.
+            let id = {
+                static NEXT: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(1);
+                format!("sh{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+            };
+            let spawned = shell.spawn_bg(&id, &cmd, &jobs, !bg);
+            let bgshell = match spawned {
+                Ok(b) => b,
+                Err(e) => return err(cmd, format!("spawn failed: {e}")),
+            };
+            shells.lock().unwrap().push(bgshell.clone());
+
+            if bg {
+                return ToolOutcome {
+                    command: cmd,
+                    result: ShellResult {
+                        stdout: format!("bg shell {id} started — log: {}", bgshell.log_path),
+                        stderr: String::new(),
+                        code: Some(0),
+                        duration: std::time::Duration::ZERO,
+                        timed_out: false,
+                        error: None,
+                    },
+                    spilled: None,
+                };
+            }
+
+            // Foreground: wait for exit / timeout / demote.
+            match shell.wait_bg(&bgshell, demote) {
+                Some(result) => {
+                    shells.lock().unwrap().retain(|s| s.id != bgshell.id);
+                    let spilled = if result.error.is_none()
+                        && !result.timed_out
+                        && result.stdout.len() + result.stderr.len() > INLINE_CAP
+                    {
+                        spill_output(&result)
+                    } else {
+                        None
+                    };
+                    ToolOutcome {
+                        command: cmd,
+                        result,
+                        spilled,
+                    }
+                }
+                None => {
+                    // Demoted — keep it running as a normal bg shell.
+                    bgshell
+                        .transient
+                        .store(false, std::sync::atomic::Ordering::Relaxed);
+                    ToolOutcome {
+                        command: cmd,
+                        result: ShellResult {
+                            stdout: format!(
+                                "demoted to bg shell {id} — log: {}",
+                                bgshell.log_path
+                            ),
+                            stderr: String::new(),
+                            code: Some(0),
+                            duration: std::time::Duration::ZERO,
+                            timed_out: false,
+                            error: None,
+                        },
+                        spilled: None,
+                    }
+                }
+            }
+        }
+        other => err(String::new(), format!("error: unknown tool '{other}'")),
     }
 }

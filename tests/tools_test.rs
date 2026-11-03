@@ -1,10 +1,17 @@
-use oxigolem::shell::Shell;
 use oxigolem::agent::tools;
+use oxigolem::shell::{new_bg_shells, BgStatus, Shell};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+fn rig() -> (Shell, oxigolem::shell::BgShells, Arc<AtomicBool>) {
+    (Shell::new(), new_bg_shells(), Arc::new(AtomicBool::new(false)))
+}
 
 #[test]
 fn bash_runs_command_and_captures_stdout() {
-    let sh = Shell::new();
-    let out = tools::execute(&sh, "bash", &serde_json::json!({"command": "echo hello"}));
+    let (sh, shells, demote) = rig();
+    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo hello"}));
     assert_eq!(out.result.stdout.trim(), "hello");
     assert_eq!(out.result.code, Some(0));
     assert_eq!(out.command, "echo hello");
@@ -12,9 +19,11 @@ fn bash_runs_command_and_captures_stdout() {
 
 #[test]
 fn bash_captures_stderr_and_exit_code() {
-    let sh = Shell::new();
+    let (sh, shells, demote) = rig();
     let out = tools::execute(
         &sh,
+        &shells,
+        &demote,
         "bash",
         &serde_json::json!({"command": "echo oops >&2; exit 3"}),
     );
@@ -32,9 +41,9 @@ fn bash_captures_stderr_and_exit_code() {
 
 #[test]
 fn bash_times_out_on_runaway() {
-    let sh = Shell::new();
+    let (sh, shells, demote) = rig();
     let start = std::time::Instant::now();
-    let out = tools::execute(&sh, "bash", &serde_json::json!({"command": "sleep 60"}));
+    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "sleep 60"}));
     assert!(
         start.elapsed() < std::time::Duration::from_secs(45),
         "should not wait the full sleep"
@@ -42,12 +51,15 @@ fn bash_times_out_on_runaway() {
     assert!(out.result.timed_out, "got: {:?}", out.result);
     assert!(out.result.code.is_none());
     assert!(out.to_tool_message().contains("timed out"));
+    // Timed-out foreground shell is removed from the registry — the
+    // process is dead, no live tab to keep around.
+    assert_eq!(shells.lock().unwrap().len(), 0);
 }
 
 #[test]
 fn bash_missing_command_errors() {
-    let sh = Shell::new();
-    let out = tools::execute(&sh, "bash", &serde_json::json!({}));
+    let (sh, shells, demote) = rig();
+    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({}));
     assert!(
         out.result.error.as_deref().unwrap_or("").contains("error"),
         "got: {:?}",
@@ -57,8 +69,8 @@ fn bash_missing_command_errors() {
 
 #[test]
 fn execute_unknown_tool_errors() {
-    let sh = Shell::new();
-    let out = tools::execute(&sh, "nope", &serde_json::json!({}));
+    let (sh, shells, demote) = rig();
+    let out = tools::execute(&sh, &shells, &demote, "nope", &serde_json::json!({}));
     assert!(
         out.result
             .error
@@ -145,9 +157,9 @@ fn bash_output_over_pipe_buffer_does_not_deadlock() {
     // `seq 1 20000` is ~110KB — well past the 64KB pipe buffer. If the
     // shell waits for exit before draining stdout, the child blocks on
     // write and this hits the 30s timeout instead of finishing in ms.
-    let sh = Shell::new();
+    let (sh, shells, demote) = rig();
     let start = std::time::Instant::now();
-    let out = tools::execute(&sh, "bash", &serde_json::json!({"command": "seq 1 20000"}));
+    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "seq 1 20000"}));
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "big output should not stall near the timeout"
@@ -158,8 +170,8 @@ fn bash_output_over_pipe_buffer_does_not_deadlock() {
 
 #[test]
 fn small_output_stays_inline() {
-    let sh = Shell::new();
-    let out = tools::execute(&sh, "bash", &serde_json::json!({"command": "echo hi"}));
+    let (sh, shells, demote) = rig();
+    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo hi"}));
     assert!(out.spilled.is_none(), "small output must not spill");
     let msg = out.to_tool_message();
     assert!(msg.contains("hi"), "got: {msg}");
@@ -171,9 +183,11 @@ fn large_output_spills_to_file_with_preview() {
     unsafe {
         std::env::set_var("OXIGOLEM_JOBS_DIR", "/tmp/oxi-test-jobs");
     }
-    let sh = Shell::new();
+    let (sh, shells, demote) = rig();
     let out = tools::execute(
         &sh,
+        &shells,
+        &demote,
         "bash",
         &serde_json::json!({"command": "seq 1 5000"}), // ~24KB → over the 4KB inline cap
     );
@@ -195,4 +209,118 @@ fn large_output_spills_to_file_with_preview() {
         "tool message stays small despite 24KB output, got {} chars",
         msg.len()
     );
+}
+
+#[test]
+fn run_in_background_returns_immediately_with_id_and_log() {
+    let (sh, shells, demote) = rig();
+    let start = std::time::Instant::now();
+    let out = tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "sleep 2; echo done", "run_in_background": true}),
+    );
+    assert!(
+        start.elapsed() < Duration::from_millis(500),
+        "bg spawn should return immediately"
+    );
+    assert_eq!(out.result.code, Some(0));
+    assert!(out.result.stdout.contains(".log"), "got: {}", out.result.stdout);
+    // Shell registered.
+    let reg = shells.lock().unwrap();
+    assert_eq!(reg.len(), 1);
+    assert!(reg[0].log_path.ends_with(&format!("{}.log", reg[0].id)));
+    assert!(out.result.stdout.contains(&reg[0].id), "got: {}", out.result.stdout);
+    // Still running.
+    assert_eq!(reg[0].status(), BgStatus::Running);
+}
+
+#[test]
+fn run_in_background_shell_records_lines_and_exits() {
+    unsafe {
+        std::env::set_var("OXIGOLEM_JOBS_DIR", "/tmp/oxi-test-jobs-bg");
+    }
+    std::fs::create_dir_all("/tmp/oxi-test-jobs-bg").ok();
+    let (sh, shells, demote) = rig();
+    tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "echo one; echo two; echo three", "run_in_background": true}),
+    );
+    // Wait for exit.
+    for _ in 0..100 {
+        let st = {
+            let reg = shells.lock().unwrap();
+            reg.first().map(|s| s.status())
+        };
+        if matches!(st, Some(BgStatus::Exited(_))) {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let reg = shells.lock().unwrap();
+    let bg = reg.first().expect("bg shell registered");
+    assert_eq!(bg.status(), BgStatus::Exited(0));
+    let snap = bg.snapshot();
+    assert!(snap.iter().any(|l| l == "one"), "got: {snap:?}");
+    assert!(snap.iter().any(|l| l == "three"), "got: {snap:?}");
+    // Full output also on disk.
+    let disk = std::fs::read_to_string(&bg.log_path).unwrap();
+    assert!(disk.contains("two"), "got: {disk}");
+}
+
+#[test]
+fn demote_turns_foreground_call_into_bg_shell() {
+    unsafe {
+        std::env::set_var("OXIGOLEM_JOBS_DIR", "/tmp/oxi-test-jobs-dm");
+    }
+    std::fs::create_dir_all("/tmp/oxi-test-jobs-dm").ok();
+    let (sh, shells, demote) = rig();
+    // Spawn on a thread; it will block in wait_bg until demote fires.
+    let shells2 = Arc::clone(&shells);
+    let demote2 = Arc::clone(&demote);
+    let sh2 = sh.clone();
+    let h = std::thread::spawn(move || {
+        tools::execute(
+            &sh2,
+            &shells2,
+            &demote2,
+            "bash",
+            &serde_json::json!({"command": "sleep 30"}),
+        )
+    });
+    // Wait for the shell to register, then demote.
+    for _ in 0..100 {
+        if shells.lock().unwrap().len() == 1 {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert_eq!(shells.lock().unwrap().len(), 1, "shell registered");
+    demote.store(true, Ordering::Relaxed);
+    let out = h.join().expect("execute returned");
+    // Demoted → early return carrying the shell id + log path.
+    assert_eq!(out.result.code, Some(0));
+    assert!(out.result.stdout.contains("demoted"), "got: {}", out.result.stdout);
+    let id = shells.lock().unwrap()[0].id.clone();
+    assert!(out.result.stdout.contains(&id), "got: {}", out.result.stdout);
+    // Shell stays in the registry, no longer transient, still running.
+    let reg = shells.lock().unwrap();
+    assert_eq!(reg.len(), 1);
+    assert!(!reg[0].transient.load(Ordering::Relaxed));
+    assert_eq!(reg[0].status(), BgStatus::Running);
+    // Clean up the sleeper.
+    reg[0].kill();
+}
+
+#[test]
+fn foreground_shell_removed_from_registry_on_exit() {
+    let (sh, shells, demote) = rig();
+    let _ = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo x"}));
+    // Foreground (transient) shells are removed once execute finishes.
+    assert_eq!(shells.lock().unwrap().len(), 0);
 }

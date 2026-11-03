@@ -42,17 +42,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         terminal.draw(|f| draw(f, &app))?;
 
         app.poll_chat();
+        app.poll_shells();
+        app.normalize_view();
         app.tick = app.tick.wrapping_add(1);
 
         if event::poll(Duration::from_millis(50))? {
             match event::read()? {
-                Event::Mouse(m) if app.view == View::Agent && app.modal.is_none() => {
-                    match m.kind {
-                        MouseEventKind::ScrollUp => app.scroll_up(3),
-                        MouseEventKind::ScrollDown => app.scroll_down(3),
-                        _ => {}
-                    }
-                }
+                Event::Mouse(m) if app.modal.is_none() => match (app.view, m.kind) {
+                    (View::Agent, MouseEventKind::ScrollUp) => app.scroll_up(3),
+                    (View::Agent, MouseEventKind::ScrollDown) => app.scroll_down(3),
+                    (View::Shell(_), MouseEventKind::ScrollUp) => app.term_scroll_up(3),
+                    (View::Shell(_), MouseEventKind::ScrollDown) => app.term_scroll_down(3),
+                    _ => {}
+                },
                 Event::Paste(text) if app.modal.is_none() => app.push_paste(text),
                 Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
                     KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -69,14 +71,33 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                     {
                         app.toggle_tool_expand()
                     }
+                    KeyCode::Char('b') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        if app.ctrl_b() == "first" {
+                            app.toast = Some("ctrl+b again to demote".to_string());
+                        } else {
+                            app.toast = Some("demoted to background".to_string());
+                        }
+                    }
                     code if app.modal.is_some() => app.modal_key(code),
-                    KeyCode::PageUp if app.view == View::Agent => app.scroll_up(10),
-                    KeyCode::PageDown if app.view == View::Agent => app.scroll_down(10),
-                    KeyCode::Up if app.view == View::Agent => app.scroll_up(1),
-                    KeyCode::Down if app.view == View::Agent => app.scroll_down(1),
+                    KeyCode::PageUp => match app.view {
+                        View::Agent => app.scroll_up(10),
+                        View::Shell(_) => app.term_scroll_up(10),
+                    },
+                    KeyCode::PageDown => match app.view {
+                        View::Agent => app.scroll_down(10),
+                        View::Shell(_) => app.term_scroll_down(10),
+                    },
+                    KeyCode::Up => match app.view {
+                        View::Agent => app.scroll_up(1),
+                        View::Shell(_) => app.term_scroll_up(1),
+                    },
+                    KeyCode::Down => match app.view {
+                        View::Agent => app.scroll_down(1),
+                        View::Shell(_) => app.term_scroll_down(1),
+                    },
                     KeyCode::BackTab => {
                         app.dismiss_toast();
-                        app.toggle_view();
+                        app.next_view();
                     }
                     KeyCode::Esc => {
                         if app.esc() {
@@ -113,9 +134,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             Constraint::Min(0),    // body
             Constraint::Length(ui::input::height_for(
                 &app.input_display(),
-                app.pending_queue(),
                 area.width,
-            )), // input (grows downward, queue rows on top)
+            )), // input (grows downward)
             Constraint::Length(2), // footer status bar
         ])
         .split(area);
@@ -130,17 +150,16 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             app.scroll_back,
             app.gen_done_tick,
         ),
-        View::Output => ui::output::draw(f, root[0], &app.term_lines),
+        View::Shell(i) => {
+            let reg = app.shells.lock().unwrap();
+            if let Some(sh) = reg.get(i) {
+                ui::output::draw(f, root[0], sh, app.term_scroll);
+            }
+        }
     }
 
-    ui::input::draw(
-        f,
-        root[1],
-        &app.input_display(),
-        app.pending_queue(),
-        app.tick,
-    );
-    ui::header::draw(f, root[2], app.view, app.connected.as_ref());
+    ui::input::draw(f, root[1], &app.input_display(), app.tick);
+    ui::header::draw(f, root[2], app.view, app.connected.as_ref(), &app.shells);
 
     if let Some(m) = &app.modal {
         ui::modal::draw(f, area, m, &app.modal_items());

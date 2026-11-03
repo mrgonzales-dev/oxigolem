@@ -12,8 +12,7 @@ use crate::theme::{FAINT, ORANGE, TEXT};
 const MAX_LINES: u16 = 3;
 
 /// Number of terminal rows the input area needs (border + wrapped lines, capped).
-/// `queued` prompts each take one row above the input line.
-pub fn height_for(input: &str, queued: &[String], width: u16) -> u16 {
+pub fn height_for(input: &str, width: u16) -> u16 {
     let usable = width.saturating_sub(3) as usize; // "❯ " prefix + cursor
     if usable == 0 {
         return 2;
@@ -23,7 +22,7 @@ pub fn height_for(input: &str, queued: &[String], width: u16) -> u16 {
     } else {
         (input.chars().count() + 1).div_ceil(usable) as u16
     };
-    queued.len() as u16 + lines.min(MAX_LINES) + 1 // +1 for top border
+    lines.min(MAX_LINES) + 1 // +1 for top border
 }
 
 /// Wrap `text` into lines of `usable` chars and return the last `max` of them,
@@ -41,8 +40,8 @@ fn wrapped_tail(input: &str, usable: usize, max: usize) -> Vec<String> {
     lines[start..].to_vec()
 }
 
-pub fn draw(f: &mut Frame, area: Rect, input: &str, queued: &[String], tick: u64) {
-    let content_height = area.height.saturating_sub(1 + queued.len() as u16) as usize; // minus border + queue rows
+pub fn draw(f: &mut Frame, area: Rect, input: &str, tick: u64) {
+    let content_height = area.height.saturating_sub(1) as usize; // minus top border
     let usable = area.width.saturating_sub(3) as usize;
     // Blink the cursor at ~10 ticks per on/off cycle (~500ms at 50ms/tick).
     let cursor_on = tick % 20 < 12;
@@ -50,13 +49,6 @@ pub fn draw(f: &mut Frame, area: Rect, input: &str, queued: &[String], tick: u64
     let cursor_style = Style::default().fg(ORANGE);
 
     let mut content: Vec<Line> = Vec::new();
-    // Queued prompts render dimmed above the input line.
-    for q in queued {
-        content.push(Line::from(vec![
-            Span::styled("⏳ ", Style::default().fg(ORANGE)),
-            Span::styled(q.clone(), Style::default().fg(FAINT)),
-        ]));
-    }
 
     if input.is_empty() {
         content.push(Line::from(vec![

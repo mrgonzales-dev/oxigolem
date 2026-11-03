@@ -9,13 +9,15 @@ use crate::{
     },
     modal::{Connection, Kind, Modal},
     provider::{self, Provider},
-    shell::Shell,
+    shell::{new_bg_shells, BgShells, Shell},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Agent,
-    Output,
+    /// Showing the output of the background shell at this index in
+    /// `App::shells`. Blue-accented — same look as the old terminal view.
+    Shell(usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -53,37 +55,43 @@ pub struct App {
     pub view: View,
     parts: Vec<InputPart>,
     next_paste_id: usize,
-    pub term_lines: Vec<String>,
     pub modal: Option<Modal>,
     pub connected: Option<Connection>,
     pub toast: Option<String>,
     pub transcript: Vec<TranscriptEntry>,
     providers: Vec<Arc<dyn Provider>>,
     pub chat: Option<ChatEngine>,
-    /// Shared terminal: user commands in Output view and the agent's
-    /// `bash` tool run in the same working directory.
+    /// Shared shell cwd — every bash call the agent makes runs here.
+    /// `ChatEngine::with_all` clones this into the worker.
     pub shell: Shell,
+    /// Registry of every spawned background/transient shell. The
+    /// footer reads it for tabs; `tools::execute` pushes to it.
+    pub shells: BgShells,
     /// Frame counter for animations — bumps every loop tick.
     pub tick: u64,
     /// Manual scrollback offset (visual rows up from the bottom).
     /// `None` = follow newest; `Some(n)` = pinned n rows up.
     pub scroll_back: Option<u16>,
+    /// Same scroll-pin idea for Shell views — kept separate from
+    /// `scroll_back` so each view remembers its own position.
+    pub term_scroll: Option<u16>,
     /// Tick when the last generation finished — drives the shimmer→dim
     /// fade so thinking text eases out instead of snapping.
     pub gen_done_tick: Option<u64>,
-    /// Prompts submitted while a generation was in flight. They sit
-    /// above the input as "waiting" and auto-send when the current
-    /// generation ends (Done) or is interrupted (Cancelled).
-    pub pending_queue: Vec<String>,
 }
 
 impl App {
     pub fn new() -> Self {
+        // Spill files live under the project the TUI was opened in —
+        // `<launch-cwd>/.oxigolem/jobs`. Created eagerly; tools::execute
+        // picks this up via `init_project_jobs_dir`.
+        if let Ok(cwd) = std::env::current_dir() {
+            crate::agent::tools::init_project_jobs_dir(&cwd);
+        }
         Self {
             view: View::Agent,
             parts: Vec::new(),
             next_paste_id: 1,
-            term_lines: vec!["oxigolem terminal — type a command below".to_string()],
             modal: None,
             connected: None,
             toast: None,
@@ -91,10 +99,11 @@ impl App {
             providers: provider::registry(),
             chat: None,
             shell: Shell::new(),
+            shells: new_bg_shells(),
             tick: 0,
             scroll_back: None,
+            term_scroll: None,
             gen_done_tick: None,
-            pending_queue: Vec::new(),
         }
     }
 
@@ -109,6 +118,20 @@ impl App {
             match v.checked_sub(n) {
                 Some(0) | None => self.scroll_back = None,
                 Some(rest) => self.scroll_back = Some(rest),
+            }
+        }
+    }
+
+    /// Shell-view scroll — same pin semantics on the bg-shell buffer.
+    pub fn term_scroll_up(&mut self, n: u16) {
+        self.term_scroll = Some(self.term_scroll.unwrap_or(0).saturating_add(n));
+    }
+
+    pub fn term_scroll_down(&mut self, n: u16) {
+        if let Some(v) = self.term_scroll {
+            match v.checked_sub(n) {
+                Some(0) | None => self.term_scroll = None,
+                Some(rest) => self.term_scroll = Some(rest),
             }
         }
     }
@@ -202,17 +225,15 @@ impl App {
                     provider: self.providers[provider].name(),
                     model: choice.clone(),
                 });
-                self.chat = Some(ChatEngine::with_shell(p, choice, self.shell.clone()));
+                self.chat = Some(ChatEngine::with_all(
+                    p,
+                    choice,
+                    self.shell.clone(),
+                    Arc::clone(&self.shells),
+                ));
                 None
             }
             Kind::Message(_) => None,
-        };
-    }
-
-    pub fn toggle_view(&mut self) {
-        self.view = match self.view {
-            View::Agent => View::Output,
-            View::Output => View::Agent,
         };
     }
 
@@ -238,7 +259,7 @@ impl App {
         for part in &self.parts {
             match part {
                 InputPart::Text(c) => out.push(*c),
-                InputPart::Paste { content, .. } => out.push_str(content),
+                InputPart::Paste { content, .. } => out.push_str(content.as_str()),
             }
         }
         out
@@ -262,39 +283,94 @@ impl App {
         self.parts.push(InputPart::Paste { id, content });
     }
 
-    pub fn run_command(&mut self) {
-        let cmd = self.input_expanded();
-        self.parts.clear();
-        let cmd = cmd.trim().to_string();
-        if cmd.is_empty() {
+    /// Cycle the view: Agent → sh1 → sh2 → … → Agent. BackTab.
+    /// Shell index is clamped to live entries — a transient shell that
+    /// finished and was removed mid-view just falls back to Agent.
+    pub fn next_view(&mut self) {
+        let count = self.shells.lock().unwrap().len();
+        self.view = match self.view {
+            View::Agent if count > 0 => View::Shell(0),
+            View::Shell(i) if i + 1 < count => View::Shell(i + 1),
+            _ => View::Agent,
+        };
+        self.term_scroll = None;
+    }
+
+    /// If the current Shell view's index is past the end of the
+    /// registry (shell finished and was removed), drop back to Agent.
+    /// Called every tick — cheap.
+    pub fn normalize_view(&mut self) {
+        if let View::Shell(i) = self.view {
+            let count = self.shells.lock().unwrap().len();
+            if i >= count {
+                self.view = View::Agent;
+                self.term_scroll = None;
+            }
+        }
+    }
+
+    /// Ctrl+B pressed — two presses within a second demote the running
+    /// foreground bash into a background shell. Returns "first" on the
+    /// first press so the UI can hint "press again".
+    pub fn ctrl_b(&mut self) -> &'static str {
+        use std::time::{Duration, Instant};
+        static LAST: std::sync::Mutex<Option<Instant>> = std::sync::Mutex::new(None);
+        let now = Instant::now();
+        let mut last = LAST.lock().unwrap();
+        match *last {
+            Some(t) if now.duration_since(t) < Duration::from_millis(600) => {
+                *last = None;
+                if let Some(c) = self.chat.as_ref() {
+                    c.demote();
+                }
+                "demoted"
+            }
+            _ => {
+                *last = Some(now);
+                "first"
+            }
+        }
+    }
+
+    /// Scan shells for exits the agent doesn't know about yet. When a
+    /// non-transient shell finishes AND the engine is idle, inject a
+    /// synthetic user message so the model gets told: "[shN exited C]
+    /// log: <path>". Done here (not in the reader thread) so it only
+    /// fires while the app is alive to render it.
+    pub fn poll_shells(&mut self) {
+        let Some(engine) = &mut self.chat else { return };
+        if engine.is_busy() {
             return;
         }
-
-        self.term_lines.push(format!("$ {cmd}"));
-
-        if cmd == "clear" {
-            self.term_lines.clear();
-            return;
+        let pokes: Vec<String> = {
+            let reg = self.shells.lock().unwrap();
+            reg.iter()
+                .filter(|s| {
+                    !s.transient.load(std::sync::atomic::Ordering::Relaxed)
+                        && !s.poked.load(std::sync::atomic::Ordering::Relaxed)
+                        && matches!(
+                            s.status(),
+                            crate::shell::BgStatus::Exited(_) | crate::shell::BgStatus::Killed
+                        )
+                })
+                .map(|s| {
+                    s.poked.store(true, std::sync::atomic::Ordering::Relaxed);
+                    match s.status() {
+                        crate::shell::BgStatus::Exited(c) => format!(
+                            "[{} exited {c}]\nlog: {}",
+                            s.id, s.log_path
+                        ),
+                        _ => format!("[{} killed]\nlog: {}", s.id, s.log_path),
+                    }
+                })
+                .collect()
+        };
+        for p in pokes {
+            self.dispatch_chat(p);
         }
-
-        // Shared shell — a `cd` here also moves the agent's bash tool.
-        let out = self.shell.run(&cmd);
-        for line in out.lines() {
-            self.term_lines.push(line.to_string());
-        }
     }
 
-    /// Number of prompts sitting in the pending queue.
-    pub fn pending_queue_len(&self) -> usize {
-        self.pending_queue.len()
-    }
-
-    /// Read queued prompts for the input-area "waiting" display.
-    pub fn pending_queue(&self) -> &[String] {
-        &self.pending_queue
-    }
-
-    /// Send a prompt straight to the engine (no queueing). Pushes the
+    /// Send a prompt straight to the engine. Pushes the
     /// User transcript entry and starts the generation.
     fn dispatch_chat(&mut self, text: String) {
         self.transcript.push(TranscriptEntry {
@@ -308,20 +384,6 @@ impl App {
             self.toast = Some(e);
             self.transcript.pop();
         }
-    }
-
-    /// Pop the front of the pending queue and send it, if anything is
-    /// waiting. Called after a generation ends so queued prompts fire
-    /// back-to-back.
-    fn send_next_queued(&mut self) {
-        if self.chat.is_none() || self.chat.as_ref().unwrap().is_busy() {
-            return;
-        }
-        if self.pending_queue.is_empty() {
-            return;
-        }
-        let text = self.pending_queue.remove(0);
-        self.dispatch_chat(text);
     }
 
     /// Send input to the connected model. Called on Enter in Agent view.
@@ -342,14 +404,14 @@ impl App {
                 // is the interrupt key.
                 return;
             }
-            // Force-send: cancel the running generation and jump this
-            // prompt to the front of the queue. It fires when the
-            // Cancelled event lands.
+            // Force-send: kill the running generation NOW (drop its
+            // channel — the worker unwinds on its own) and dispatch
+            // the new prompt immediately. No waiting for Cancelled.
             self.parts.clear();
-            self.pending_queue.insert(0, text);
             if let Some(c) = self.chat.as_mut() {
-                c.cancel();
+                c.force_abort();
             }
+            self.dispatch_chat(text);
             return;
         }
 
@@ -364,7 +426,6 @@ impl App {
     pub fn poll_chat(&mut self) {
         let Some(engine) = &mut self.chat else { return };
         let events = engine.poll();
-        let mut ended = false;
         for ev in events {
             match ev {
                 ChatEvent::Thinking(t) => {
@@ -431,7 +492,6 @@ impl App {
                         expanded: false,
                     });
                     self.gen_done_tick = Some(self.tick);
-                    ended = true;
                 }
                 ChatEvent::Done(msgs) => {
                     engine.record_appended(msgs);
@@ -441,7 +501,6 @@ impl App {
                     if self.gen_done_tick.is_none() {
                         self.gen_done_tick = Some(self.tick);
                     }
-                    ended = true;
                 }
                 ChatEvent::Error(e) => {
                     while let Some(last) = self.transcript.last()
@@ -457,12 +516,8 @@ impl App {
                         expanded: false,
                     });
                     self.toast = Some("chat failed — see transcript".to_string());
-                    ended = true;
                 }
             }
-        }
-        if ended {
-            self.send_next_queued();
         }
     }
 
@@ -482,16 +537,16 @@ impl App {
         });
     }
 
-    /// Esc pressed. Cancels an in-flight generation if one is running;
-    /// otherwise returns true so the caller can quit.
+    /// Esc pressed. Cancels an in-flight generation if one is running —
+    /// that is its only job. Quitting lives on Ctrl+C (double-press),
+    /// so Esc always returns false.
     pub fn esc(&mut self) -> bool {
-        if self.chat.as_ref().is_some_and(|c| c.is_busy()) {
-            if let Some(c) = self.chat.as_mut() {
-                c.cancel();
-            }
-            return false;
+        if let Some(c) = self.chat.as_mut()
+            && c.is_busy()
+        {
+            c.cancel();
         }
-        true
+        false
     }
 
     /// Toggle the most recent tool block between collapsed and expanded.
@@ -507,11 +562,12 @@ impl App {
         }
     }
 
-    /// Route Enter based on the current view.
+    /// Route Enter based on the current view. Shell views are
+    /// read-only — Enter there does nothing.
     pub fn handle_enter(&mut self) {
         match self.view {
             View::Agent => self.send_chat(),
-            View::Output => self.run_command(),
+            View::Shell(_) => {}
         }
     }
 }

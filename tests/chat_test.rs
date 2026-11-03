@@ -737,14 +737,20 @@ fn enter_while_busy_queues_prompt() {
     std::thread::sleep(Duration::from_millis(50));
     assert!(app.chat_busy());
 
-    // Type + hit Enter while busy — should queue, not call send().
+    // Type + hit Enter while busy — force-sends: aborts the in-flight
+    // generation and dispatches this prompt immediately as a User entry.
     app.push_char('q');
     app.handle_enter();
-    assert_eq!(app.pending_queue_len(), 1, "prompt should be queued");
+    let users = app
+        .transcript
+        .iter()
+        .filter(|e| matches!(e.role, Role::User))
+        .count();
+    assert_eq!(users, 1, "force-send pushes the prompt immediately");
 }
 
 #[test]
-fn second_enter_cancels_and_sends_queued() {
+fn second_enter_force_sends_immediately() {
     struct SlowProvider;
     impl Provider for SlowProvider {
         fn name(&self) -> &'static str {
@@ -777,27 +783,21 @@ fn second_enter_cancels_and_sends_queued() {
     app.handle_enter();
     std::thread::sleep(Duration::from_millis(50));
 
-    // Queue one prompt.
+    // Second Enter with text — interrupts the running generation and
+    // dispatches this prompt immediately (no waiting for Cancelled).
     app.push_char('a');
     app.handle_enter();
-    assert_eq!(app.pending_queue_len(), 1);
-
-    // Press Enter again (empty input) — cancels current gen; the queued
-    // prompt should auto-send as soon as Cancelled lands.
-    app.handle_enter();
-    std::thread::sleep(Duration::from_millis(150));
-    app.poll_chat(); // drain Cancelled, which should trigger pop+send
-    std::thread::sleep(Duration::from_millis(400));
-    app.poll_chat(); // let second send finish
-
-    assert_eq!(app.pending_queue_len(), 0, "queue drained");
-    // Two User entries: original + queued.
+    // Two User entries right away — original + force-sent.
     let users = app
         .transcript
         .iter()
         .filter(|e| matches!(e.role, Role::User))
         .count();
-    assert_eq!(users, 2, "queued prompt became a real user entry");
+    assert_eq!(users, 2, "force-sent prompt lands as a User entry now");
+    // A new generation for 'a' is running.
+    assert!(app.chat_busy());
+    std::thread::sleep(Duration::from_millis(450));
+    app.poll_chat();
 }
 
 #[test]

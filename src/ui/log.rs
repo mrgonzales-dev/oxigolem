@@ -135,7 +135,10 @@ pub fn draw(
                 // `✓ exit 0 · duration` footer. Output past
                 // COLLAPSE_LINES collapses into a `… (N lines hidden)`
                 // row until the user toggles with Ctrl+E.
-                const COLLAPSE_LINES: usize = 8;
+                const COLLAPSE_LINES: usize = 4;
+                // One wrapped line can still fill the screen (e.g. a
+                // 10KB classpath arg) — cap visible chars per line too.
+                const LINE_CAP: usize = 240;
 
                 // In-flight placeholder (ToolCall arrived, ToolResult
                 // hasn't yet) renders the header alone. Chat errors and
@@ -208,9 +211,26 @@ pub fn draw(
                         &body[..COLLAPSE_LINES]
                     };
                     for l in show {
+                        let clipped = if l.chars().count() > LINE_CAP {
+                            format!(
+                                "{} …",
+                                l.chars().take(LINE_CAP).collect::<String>()
+                            )
+                        } else {
+                            l.clone()
+                        };
                         lines.push(Line::from(vec![
                             Span::styled(format!("{pad}  "), Style::default()),
-                            Span::styled(l.clone(), Style::default().fg(TEXT)),
+                            Span::styled(clipped, Style::default().fg(TEXT)),
+                        ]));
+                    }
+                    if let Some(path) = &out.spilled {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{pad}  "), Style::default()),
+                            Span::styled(
+                                format!("⎿ full output: {path}"),
+                                Style::default().fg(ORANGE_DIM),
+                            ),
                         ]));
                     }
                     if !entry.expanded && total > COLLAPSE_LINES {

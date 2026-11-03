@@ -10,7 +10,7 @@ use super::{
     tools::{self, ToolOutcome},
 };
 use crate::provider::{Provider, StreamChunk};
-use crate::shell::Shell;
+use crate::shell::{new_bg_shells, BgShells, Shell};
 
 /// A tool call requested by the model (Ollama `message.tool_calls` shape).
 #[derive(Clone, Debug, PartialEq)]
@@ -90,25 +90,31 @@ pub struct ChatEngine {
     /// Esc; the loop checks it between iterations and inside the chunk
     /// callback so the stream aborts on the next chunk.
     cancel: Arc<AtomicBool>,
-    /// Shared with the user's Output-view terminal — one shell, one cwd.
+    /// Shared shell cwd — every bash call runs in this directory.
     shell: Shell,
+    /// Registry of background shells — every bash call (foreground or
+    /// `run_in_background`) spawns through this so the UI can show a
+    /// live tab per shell.
+    shells: BgShells,
+    /// Ctrl+B×2 sets this — the foreground bash wait returns early, the
+    /// process keeps running as a normal background shell, and the tool
+    /// result hands the model the shell id + log path instead of output.
+    demote: Arc<AtomicBool>,
 }
 
 impl ChatEngine {
     pub fn new(provider: Arc<dyn Provider>, model: String) -> Self {
-        Self {
-            provider,
-            model,
-            history: Vec::new(),
-            rx: None,
-            cancel: Arc::new(AtomicBool::new(false)),
-            shell: Shell::new(),
-        }
+        Self::with_all(provider, model, Shell::new(), new_bg_shells())
     }
 
-    /// Use an existing shared shell (the app's terminal shell) so agent
-    /// commands and user commands share one working directory.
-    pub fn with_shell(provider: Arc<dyn Provider>, model: String, shell: Shell) -> Self {
+    /// Full wiring — app passes its shared shell AND the bg-shell
+    /// registry the footer tabs render from.
+    pub fn with_all(
+        provider: Arc<dyn Provider>,
+        model: String,
+        shell: Shell,
+        shells: BgShells,
+    ) -> Self {
         Self {
             provider,
             model,
@@ -116,6 +122,8 @@ impl ChatEngine {
             rx: None,
             cancel: Arc::new(AtomicBool::new(false)),
             shell,
+            shells,
+            demote: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -136,10 +144,13 @@ impl ChatEngine {
         let (tx, rx) = std::sync::mpsc::channel::<ChatEvent>();
         self.rx = Some(rx);
         self.cancel.store(false, Ordering::Relaxed);
+        self.demote.store(false, Ordering::Relaxed);
 
         let provider = Arc::clone(&self.provider);
         let model = self.model.clone();
         let shell = self.shell.clone();
+        let shells = Arc::clone(&self.shells);
+        let demote = Arc::clone(&self.demote);
         let cancel = Arc::clone(&self.cancel);
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
         msgs.push(Message::system(&system_prompt()));
@@ -147,41 +158,63 @@ impl ChatEngine {
 
         thread::spawn(move || {
             let mut appended: Vec<Message> = Vec::new();
-            let tool_specs = tools::specs();
             let result = (|| -> Result<(), String> {
                 for _ in 0..MAX_ITERATIONS {
                     if cancel.load(Ordering::Relaxed) {
                         return Err("__cancelled__".to_string());
                     }
-                    let text = std::cell::RefCell::new(String::new());
-                    let calls = std::cell::RefCell::new(Vec::<ToolCall>::new());
-                    let cancel_inner = Arc::clone(&cancel);
-                    provider.chat(&model, &msgs, &tool_specs, &|chunk| {
-                        // Abort as soon as the next chunk arrives after
-                        // Esc — the underlying HTTP read can't be
-                        // interrupted mid-recv, so this is the earliest
-                        // we can bail.
-                        if cancel_inner.load(Ordering::Relaxed) {
-                            return;
+                    // Run the provider stream on its own thread so the
+                    // agent loop polls cancel every ~50ms — a stalled
+                    // HTTP read otherwise holds the whole reply hostage
+                    // until the next chunk arrives.
+                    let (ptx, prx) = std::sync::mpsc::channel::<Result<StreamChunk, String>>();
+                    {
+                        let provider = Arc::clone(&provider);
+                        let model = model.clone();
+                        let msgs = msgs.clone();
+                        let specs = tools::specs();
+                        thread::spawn(move || {
+                            let r = provider.chat(&model, &msgs, &specs, &|chunk| {
+                                let _ = ptx.send(Ok(chunk));
+                            });
+                            let _ = ptx.send(match r {
+                                Ok(()) => Err("__provider_done__".to_string()),
+                                Err(e) => Err(e),
+                            });
+                        });
+                    }
+                    let mut text = String::new();
+                    let mut calls: Vec<ToolCall> = Vec::new();
+                    // Pump provider chunks until it signals done or the
+                    // cancel flag fires.
+                    loop {
+                        match prx.recv_timeout(std::time::Duration::from_millis(50)) {
+                            Ok(Ok(chunk)) => match chunk {
+                                StreamChunk::Content(t) => {
+                                    text.push_str(&t);
+                                    let _ = tx.send(ChatEvent::Token(t));
+                                }
+                                StreamChunk::Thinking(t) => {
+                                    let _ = tx.send(ChatEvent::Thinking(t));
+                                }
+                                StreamChunk::ToolCall { name, arguments } => {
+                                    calls.push(ToolCall { name, arguments });
+                                }
+                            },
+                            // Provider finished (sent __provider_done__) or hit an error.
+                            Ok(Err(e)) if e == "__provider_done__" => break,
+                            Ok(Err(e)) => return Err(e),
+                            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                                if cancel.load(Ordering::Relaxed) {
+                                    return Err("__cancelled__".to_string());
+                                }
+                            }
+                            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
                         }
-                        match chunk {
-                            StreamChunk::Content(t) => {
-                                text.borrow_mut().push_str(&t);
-                                let _ = tx.send(ChatEvent::Token(t));
-                            }
-                            StreamChunk::Thinking(t) => {
-                                let _ = tx.send(ChatEvent::Thinking(t));
-                            }
-                            StreamChunk::ToolCall { name, arguments } => {
-                                calls.borrow_mut().push(ToolCall { name, arguments });
-                            }
-                        }
-                    })?;
+                    }
                     if cancel.load(Ordering::Relaxed) {
                         return Err("__cancelled__".to_string());
                     }
-                    let text = text.into_inner();
-                    let calls = calls.into_inner();
 
                     let mut assistant = Message::assistant(text);
                     if !calls.is_empty() {
@@ -198,7 +231,8 @@ impl ChatEngine {
                             name: call.name.clone(),
                             args: call.arguments.clone(),
                         });
-                        let outcome = tools::execute(&shell, &call.name, &call.arguments);
+                        let outcome =
+                            tools::execute(&shell, &shells, &demote, &call.name, &call.arguments);
                         let text = outcome.to_tool_message();
                         let _ = tx.send(ChatEvent::ToolResult {
                             name: call.name.clone(),
@@ -229,11 +263,26 @@ impl ChatEngine {
         Ok(())
     }
 
+    /// Ctrl+B×2: the in-flight foreground bash keeps running but the
+    /// tool returns early — it becomes a normal background shell tab.
+    pub fn demote(&self) {
+        self.demote.store(true, Ordering::Relaxed);
+    }
+
     /// Cancel an in-flight generation. The worker thread observes the
     /// flag at the next chunk or loop boundary and emits `Cancelled`.
     /// The user's message stays in history — the model still saw it.
     pub fn cancel(&mut self) {
         self.cancel.store(true, Ordering::Relaxed);
+    }
+
+    /// Cancel AND drop the event channel: the worker unwinds on its own
+    /// (its sends fail silently on the dead channel) but `is_busy()`
+    /// clears right now so the next `send` doesn't wait for the worker.
+    /// Used by force-send — the interrupt must feel instant.
+    pub fn force_abort(&mut self) {
+        self.cancel.store(true, Ordering::Relaxed);
+        self.rx = None;
     }
 
     /// Drain all pending events. Called every event-loop iteration.
