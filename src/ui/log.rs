@@ -34,6 +34,13 @@ pub fn draw(
     // margin instead of hugging the edge.
     let body_w = (area.width as usize).saturating_sub(pad.len() + 2 + rmargin.len());
 
+    // Index of the trailing Thinking entry (if any) — only it animates;
+    // older thinking blocks stay FAINT so a new chat's shimmer doesn't
+    // re-light earlier reasoning.
+    let last_thinking = transcript
+        .iter()
+        .rposition(|e| matches!(e.role, Role::Thinking));
+
     for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
             Role::User => {
@@ -59,9 +66,14 @@ pub fn draw(
                 // "✻ reasoning…" — pre-wrap to body_w so every visual row
                 // keeps the left margin; right margin comes free since
                 // pre-wrapped rows never reach the edge.
-                let live = thinking_live && ei + 1 == transcript.len();
+                // Only the most recent thinking block animates — earlier
+                // ones are always settled FAINT.
+                let fresh = Some(ei) == last_thinking;
+                let live = fresh && thinking_live && ei + 1 == transcript.len();
                 // Fade shimmer → FAINT over ~20 ticks after generation ends.
-                let fade = if live {
+                let fade = if !fresh {
+                    0.0
+                } else if live {
                     1.0
                 } else {
                     match gen_done_tick {
