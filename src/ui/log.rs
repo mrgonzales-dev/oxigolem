@@ -24,8 +24,9 @@ pub fn draw(
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
     let pad = "  ";
-    // Extra indent for thinking/reply bodies past the marker.
-    let body = "  ";
+    // Inner margin for thinking/reply bodies — sits the text in from the
+    // marker and the right edge.
+    let body = "    ";
 
     for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
@@ -57,10 +58,10 @@ pub fn draw(
                 for (i, l) in entry.text.lines().enumerate() {
                     let marker = if i == 0 { "✻ " } else { "  " };
                     let mut spans = vec![Span::styled(
-                        pad.to_string() + marker,
+                        pad.to_string() + marker + body,
                         Style::default().fg(FAINT),
                     )];
-                    for c in format!("{body}{l}{body}").chars() {
+                    for c in format!("{l}{body}").chars() {
                         spans.push(Span::styled(
                             c.to_string(),
                             Style::default().fg(shade(live, col, tick)),
@@ -88,6 +89,7 @@ pub fn draw(
                     prefixed.spans.push(Span::raw(body));
                     lines.push(prefixed);
                 }
+                lines.push(Line::default());
                 lines.push(Line::default());
             }
             Role::Tool => {
