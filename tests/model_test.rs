@@ -155,7 +155,7 @@ fn inspect_parses_model_info_and_caches() {
     // Disk cache written — a fresh Ollama instance reads it without
     // hitting the (now-dead) server.
     drop(ollama);
-    let ollama2 = Ollama::new(format!("http://127.0.0.1:1")); // dead port
+    let ollama2 = Ollama::new("http://127.0.0.1:1".to_string()); // dead port
     let info3 = ollama2.inspect("qwen3:1.7b").expect("disk-cached inspect");
     assert_eq!(info3.context_length, 40960);
     unsafe { std::env::remove_var("OXIGOLEM_CONFIG_DIR") };

@@ -1,3 +1,4 @@
+pub mod budget;
 pub mod chat;
 pub mod systemprompt;
 pub mod tools;

@@ -82,7 +82,10 @@ pub enum ChatEvent {
 
 /// Max model→tool→model round-trips per user message. Guards against a
 /// model that calls tools forever.
-const MAX_ITERATIONS: usize = 8;
+/// Max model→tool→model round-trips per user message. Raised from 8
+/// when prefix stability landed — a higher cap is safe now that a long
+/// session doesn't pay a cold prefill every iteration.
+pub const MAX_ITERATIONS: usize = 24;
 
 pub struct ChatEngine {
     provider: Arc<dyn Provider>,
@@ -109,6 +112,13 @@ pub struct ChatEngine {
     /// True when inspect() reports no "tools" capability — Phase 4
     /// reads this to enable fenced-block tool-call repair.
     fenced: bool,
+    /// Frozen at construction: the byte prefix of every request. Never
+    /// rebuilt per turn — rebuilding would invalidate the KV cache.
+    system_prompt: String,
+    /// Once history crosses the token budget we cut a boundary here and
+    /// commit to it. The cut never moves — a moving boundary would
+    /// rewrite bytes in the middle of the request.
+    compact_from: Option<usize>,
 }
 
 impl ChatEngine {
@@ -135,6 +145,8 @@ impl ChatEngine {
             demote: Arc::new(AtomicBool::new(false)),
             opts: ChatOptions::default(),
             fenced: false,
+            system_prompt: system_prompt(),
+            compact_from: None,
         }
     }
 
@@ -177,9 +189,24 @@ impl ChatEngine {
         let demote = Arc::clone(&self.demote);
         let cancel = Arc::clone(&self.cancel);
         let opts = self.opts.clone();
-        let mut msgs = Vec::with_capacity(self.history.len() + 1);
-        msgs.push(Message::system(&system_prompt()));
-        msgs.extend(prune_history(&self.history));
+        // Budget: pick the plan once per send. KeepAll sends history
+        // verbatim; Compact sends history[cut..] where `cut` is the
+        // committed boundary from a previous send (or a fresh one
+        // committed now). Either way the request is append-only.
+        let budget_tokens = (self.opts.num_ctx as usize).saturating_mul(3) / 4;
+        let plan = super::budget::plan(&self.history, budget_tokens, self.compact_from);
+        if let super::budget::Plan::Compact { keep_from } = plan {
+            self.compact_from = Some(keep_from);
+        }
+        let history_slice = match plan {
+            super::budget::Plan::KeepAll => &self.history[..],
+            super::budget::Plan::Compact { keep_from } => {
+                &self.history[keep_from.min(self.history.len())..]
+            }
+        };
+        let mut msgs = Vec::with_capacity(history_slice.len() + 1);
+        msgs.push(Message::system(&self.system_prompt));
+        msgs.extend(history_slice.iter().cloned());
 
         thread::spawn(move || {
             let mut appended: Vec<Message> = Vec::new();
@@ -348,29 +375,4 @@ impl ChatEngine {
     pub fn history(&self) -> &[Message] {
         &self.history
     }
-}
-
-/// Copy of `history` for the request: tool results *before* the last
-/// user message have their `content` replaced with a stub so stale
-/// output doesn't pad every request. Role/name/tool_calls survive —
-/// the API needs the call↔result pairing intact. Local `history` is
-/// untouched (full data stays in `ToolOutcome`/`spilled` files).
-pub fn prune_history(history: &[Message]) -> Vec<Message> {
-    let last_user = history.iter().rposition(|m| m.role == "user");
-    history
-        .iter()
-        .enumerate()
-        .map(|(i, m)| {
-            if m.role == "tool" && last_user.is_some_and(|u| i < u) {
-                let mut stub = m.clone();
-                stub.content = format!(
-                    "[output omitted — {} chars]",
-                    m.content.len()
-                );
-                stub
-            } else {
-                m.clone()
-            }
-        })
-        .collect()
 }
