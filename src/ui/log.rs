@@ -117,8 +117,8 @@ fn shade(live: bool, col: usize, tick: u64) -> Color {
     }
     let Color::Rgb(r1, g1, b1) = ORANGE else { return ORANGE };
     let Color::Rgb(r2, g2, b2) = THINK_HOT else { return THINK_HOT };
-    // Period ~24 columns; phase drifts left→right with the frame count.
-    let phase = (col as f32 - tick as f32 * 0.8) * (std::f32::consts::TAU / 24.0);
+    // Period ~24 columns; phase sweeps fast left→right with the frame count.
+    let phase = (col as f32 - tick as f32 * 3.2) * (std::f32::consts::TAU / 24.0);
     let t = (phase.sin() + 1.0) / 2.0; // 0..1
     let lerp = |a: u8, b: u8| (a as f32 + (b as f32 - a as f32) * t) as u8;
     Color::Rgb(lerp(r1, r2), lerp(g1, g2), lerp(b1, b2))
