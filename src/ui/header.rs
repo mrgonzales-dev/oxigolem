@@ -170,15 +170,16 @@ fn chip_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
 }
 
 /// Model-label shimmer — per-char hue: char `col` sees hue
-/// `(2°/tick) + 8°` of column offset, so a rainbow wave drifts
+/// `(3°/tick) + 12°` of column offset, so a rainbow wave drifts
 /// left→right across the label and every char keeps cycling. Full
-/// cycle per char ≈ 9 s; neighbor chars sit 8° apart. Saturation and
-/// value are held constant so it shimmers in hue only — reads as
-/// iridescence, not flashing.
+/// cycle per char = 2 s; neighbor chars sit 12° apart. A gentle
+/// brightness crest rides the wave (sine between VAL_BASE and
+/// VAL_HOT) so it pulses while the colors travel — visibly animated,
+/// not a static tint.
 pub fn model_shimmer_hue(col: usize, tick: u64) -> f32 {
-    // f64 keeps tick*2° exact to flyweight precision; the label sits
-    // on a dark bg at fixed s/v, so wraparound is the only seam.
-    let h = (tick as f64) * 2.0 + (col as f64) * 8.0;
+    // f64 keeps tick*3° exact at any reachable tick; the label sits
+    // on a dark bg, so wraparound is the only seam.
+    let h = (tick as f64) * 3.0 + (col as f64) * 12.0;
     (h % 360.0) as f32
 }
 
@@ -204,16 +205,23 @@ pub fn hsv_to_rgb(h: f32, s: f32, v: f32) -> ratatui::style::Color {
     Color::Rgb(f(r), f(g), f(b))
 }
 
-/// The shimmer itself: one span per char, hue from
-/// [`model_shimmer_hue`], s/v pinned so only hue moves.
+/// The shimmer itself: one span per char — hue from
+/// [`model_shimmer_hue`], saturation pinned, value swells with a sine
+/// crest synced to the wave (same phase as the hue) so a bright spot
+/// travels with the colors — visibly animated, not a static tint.
 fn model_spans(label: &str, tick: u64) -> Vec<Span<'static>> {
-    const SAT: f32 = 0.62;
-    const VAL: f32 = 0.82;
+    const SAT: f32 = 0.78;
+    const VAL_BASE: f32 = 0.68;
+    const VAL_HOT: f32 = 0.92;
     label
         .chars()
         .enumerate()
         .map(|(i, c)| {
-            let color = hsv_to_rgb(model_shimmer_hue(i, tick), SAT, VAL);
+            let hue = model_shimmer_hue(i, tick);
+            let wave = ((hue / 360.0) * std::f32::consts::TAU).sin();
+            let t = ((wave + 1.0) / 2.0).powf(2.0);
+            let val = VAL_BASE + (VAL_HOT - VAL_BASE) * t;
+            let color = hsv_to_rgb(hue, SAT, val);
             Span::styled(c.to_string(), Style::default().fg(color))
         })
         .collect()
