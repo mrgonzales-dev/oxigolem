@@ -322,7 +322,9 @@ fn ollama_chat_streams_tokens() {
     let tokens = RefCell::new(Vec::new());
     provider
         .chat("m", &test_messages(), &[], &|c| {
-            tokens.borrow_mut().push(c)
+            if !matches!(c, StreamChunk::Usage(_)) {
+                tokens.borrow_mut().push(c)
+            }
         })
         .unwrap();
     assert_eq!(
@@ -379,7 +381,9 @@ fn ollama_parses_tool_calls_chunk() {
     let chunks = RefCell::new(Vec::new());
     provider
         .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
-            chunks.borrow_mut().push(c)
+            if !matches!(c, StreamChunk::Usage(_)) {
+                chunks.borrow_mut().push(c)
+            }
         })
         .unwrap();
     assert_eq!(
@@ -407,7 +411,9 @@ fn ollama_parses_tool_calls_on_done_chunk() {
     let chunks = RefCell::new(Vec::new());
     provider
         .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &|c| {
-            chunks.borrow_mut().push(c)
+            if !matches!(c, StreamChunk::Usage(_)) {
+                chunks.borrow_mut().push(c)
+            }
         })
         .unwrap();
     assert_eq!(
@@ -485,7 +491,9 @@ fn ollama_chat_no_total_stream_timeout() {
     let start = std::time::Instant::now();
     provider
         .chat("m", &test_messages(), &[], &|c| {
-            tokens.borrow_mut().push(c)
+            if !matches!(c, StreamChunk::Usage(_)) {
+                tokens.borrow_mut().push(c)
+            }
         })
         .unwrap();
     // The stream took >300ms total but still completed — no total timeout.
@@ -573,7 +581,9 @@ fn ollama_chat_surfaces_thinking() {
     let tokens = RefCell::new(Vec::new());
     provider
         .chat("m", &test_messages(), &[], &|c| {
-            tokens.borrow_mut().push(c)
+            if !matches!(c, StreamChunk::Usage(_)) {
+                tokens.borrow_mut().push(c)
+            }
         })
         .unwrap();
     assert_eq!(
@@ -841,6 +851,123 @@ fn esc_cancels_in_flight_generation() {
         .iter()
         .any(|e| matches!(e.role, Role::Tool) && e.text.contains("interrupted"));
     assert!(interrupted, "transcript should show an interrupted marker");
+}
+
+// ---- Phase 0: usage instrumentation ----
+
+#[test]
+fn ollama_done_chunk_parses_usage() {
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"content\":\"hi\"}}\n\
+                    {\"done\":true,\"prompt_eval_count\":2400,\"prompt_eval_cached_count\":2380,\"eval_count\":42,\"prompt_eval_duration\":90000000,\"eval_duration\":1000000000,\"load_duration\":500000000}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+    let provider = Ollama::new(host);
+    let chunks = RefCell::new(Vec::new());
+    provider
+        .chat("m", &test_messages(), &[], &|c| {
+            chunks.borrow_mut().push(c)
+        })
+        .unwrap();
+    let usage = chunks.borrow().iter().find_map(|c| match c {
+        StreamChunk::Usage(u) => Some(u.clone()),
+        _ => None,
+    });
+    let u = usage.expect("done chunk should emit a Usage chunk");
+    assert_eq!(u.prompt, 2400);
+    assert_eq!(u.cached, 2380);
+    assert_eq!(u.eval, 42);
+    assert_eq!(u.prefill_ms, 90);
+    assert_eq!(u.eval_ms, 1000);
+    assert_eq!(u.load_ms, 500);
+}
+
+#[test]
+fn ollama_done_chunk_missing_cached_counts_as_zero() {
+    // Older servers don't emit prompt_eval_cached_count — it must
+    // degrade to 0, never None/absent.
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"content\":\"hi\"}}\n\
+                    {\"done\":true,\"prompt_eval_count\":100,\"eval_count\":10,\"eval_duration\":250000000}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+    let provider = Ollama::new(host);
+    let chunks = RefCell::new(Vec::new());
+    provider
+        .chat("m", &test_messages(), &[], &|c| {
+            chunks.borrow_mut().push(c)
+        })
+        .unwrap();
+    let u = chunks.borrow().iter().find_map(|c| match c {
+        StreamChunk::Usage(u) => Some(u.clone()),
+        _ => None,
+    });
+    let u = u.expect("usage chunk");
+    assert_eq!(u.cached, 0);
+    assert_eq!(u.cached_pct(), 0.0);
+}
+
+#[test]
+fn usage_derived_metrics_no_divide_by_zero() {
+    let u = oxigolem::provider::Usage {
+        prompt: 0,
+        cached: 0,
+        eval: 0,
+        prefill_ms: 0,
+        eval_ms: 0,
+        load_ms: 0,
+    };
+    assert_eq!(u.cached_pct(), 0.0);
+    assert_eq!(u.tokens_per_sec(), 0.0);
+}
+
+#[test]
+fn usage_math_hit_rate_and_speed() {
+    let u = oxigolem::provider::Usage {
+        prompt: 2000,
+        cached: 1990,
+        eval: 41,
+        prefill_ms: 90,
+        eval_ms: 1000,
+        load_ms: 0,
+    };
+    assert!((u.cached_pct() - 99.5).abs() < 0.01);
+    assert!((u.tokens_per_sec() - 41.0).abs() < 0.01);
+}
+
+#[test]
+fn usage_event_reaches_app() {
+    let provider = Arc::new(MockProvider {
+        chunks: Mutex::new(vec![
+            StreamChunk::Content("hi".into()),
+            StreamChunk::Usage(oxigolem::provider::Usage {
+                prompt: 100,
+                cached: 99,
+                eval: 10,
+                prefill_ms: 5,
+                eval_ms: 200,
+                load_ms: 0,
+            }),
+        ]),
+    });
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(provider, "m".into()));
+    app.chat.as_mut().unwrap().send("hi".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    app.poll_chat();
+    let u = app.last_usage.expect("last_usage populated");
+    assert_eq!(u.prompt, 100);
+    assert_eq!(u.cached, 99);
 }
 
 #[test]

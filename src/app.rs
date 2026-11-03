@@ -8,7 +8,7 @@ use crate::{
         tools::ToolOutcome,
     },
     modal::{Connection, Kind, Modal},
-    provider::{self, Provider},
+    provider::{self, Provider, Usage},
     shell::{new_bg_shells, BgShells, Shell},
 };
 
@@ -78,6 +78,10 @@ pub struct App {
     /// Tick when the last generation finished — drives the shimmer→dim
     /// fade so thinking text eases out instead of snapping.
     pub gen_done_tick: Option<u64>,
+    /// Token + timing counters from the most recent generation —
+    /// the footer reads this for `cached%` and `t/s`. `None` until
+    /// the first done chunk arrives.
+    pub last_usage: Option<Usage>,
 }
 
 impl App {
@@ -104,6 +108,7 @@ impl App {
             scroll_back: None,
             term_scroll: None,
             gen_done_tick: None,
+            last_usage: None,
         }
     }
 
@@ -479,6 +484,9 @@ impl App {
                             expanded: false,
                         }),
                     }
+                }
+                ChatEvent::Usage(u) => {
+                    self.last_usage = Some(u);
                 }
                 ChatEvent::Cancelled => {
                     // Push a small "interrupted" marker so the transcript

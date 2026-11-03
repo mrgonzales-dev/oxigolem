@@ -180,6 +180,18 @@ impl Provider for Ollama {
                     }
                 }
                 if v["done"].as_bool() == Some(true) {
+                    // The done chunk carries the counters — emit Usage
+                    // before breaking so the footer can show hit rate
+                    // and tokens/sec for the turn.
+                    got_any = true;
+                    on_chunk(StreamChunk::Usage(super::Usage {
+                        prompt: v["prompt_eval_count"].as_u64().unwrap_or(0),
+                        cached: v["prompt_eval_cached_count"].as_u64().unwrap_or(0),
+                        eval: v["eval_count"].as_u64().unwrap_or(0),
+                        prefill_ms: v["prompt_eval_duration"].as_u64().unwrap_or(0) / 1_000_000,
+                        eval_ms: v["eval_duration"].as_u64().unwrap_or(0) / 1_000_000,
+                        load_ms: v["load_duration"].as_u64().unwrap_or(0) / 1_000_000,
+                    }));
                     finished = true;
                     break;
                 }

@@ -11,6 +11,7 @@ use ratatui::{
 use crate::{
     app::View,
     modal::Connection,
+    provider::Usage,
     shell::{BgShells, BgStatus},
     theme::{BG, BLUE, FAINT, ORANGE, TEXT},
 };
@@ -25,6 +26,7 @@ pub fn draw(
     view: View,
     connected: Option<&Connection>,
     shells: &BgShells,
+    usage: Option<&Usage>,
 ) {
     let model_label = match connected {
         Some(c) => format!("{}/{}", c.provider, c.model),
@@ -38,8 +40,18 @@ pub fn draw(
         ),
         Span::raw("  "),
         Span::styled(model_label, Style::default().fg(ORANGE)),
-        Span::styled("  ·  ", Style::default().fg(FAINT)),
     ];
+
+    // Cache hit rate + generation speed from the last turn — hidden
+    // until the first done chunk lands.
+    if let Some(u) = usage {
+        spans.push(Span::styled(
+            format!("  · {:.1}% cached · {:.0} t/s", u.cached_pct(), u.tokens_per_sec()),
+            Style::default().fg(FAINT),
+        ));
+    }
+
+    spans.push(Span::styled("  ·  ", Style::default().fg(FAINT)));
 
     // Agent tab — plain text, orange when selected.
     let agent_selected = matches!(view, View::Agent);

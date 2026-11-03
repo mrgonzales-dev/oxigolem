@@ -159,7 +159,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 
     ui::input::draw(f, root[1], &app.input_display(), app.tick);
-    ui::header::draw(f, root[2], app.view, app.connected.as_ref(), &app.shells);
+    ui::header::draw(f, root[2], app.view, app.connected.as_ref(), &app.shells, app.last_usage.as_ref());
 
     if let Some(m) = &app.modal {
         ui::modal::draw(f, area, m, &app.modal_items());

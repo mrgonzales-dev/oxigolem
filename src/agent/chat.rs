@@ -9,7 +9,7 @@ use super::{
     systemprompt::system_prompt,
     tools::{self, ToolOutcome},
 };
-use crate::provider::{Provider, StreamChunk};
+use crate::provider::{Provider, StreamChunk, Usage};
 use crate::shell::{new_bg_shells, BgShells, Shell};
 
 /// A tool call requested by the model (Ollama `message.tool_calls` shape).
@@ -71,6 +71,9 @@ pub enum ChatEvent {
     /// Generation finished. Carries every message appended this round
     /// (assistant replies + tool results) so history stays complete.
     Done(Vec<Message>),
+    /// Token + timing counters from the provider's done chunk — one
+    /// per generation, used by the footer to show hit rate / t/s.
+    Usage(Usage),
     /// User pressed Esc during a generation — the partial reply stays
     /// in the transcript but is not committed to history.
     Cancelled,
@@ -199,6 +202,9 @@ impl ChatEngine {
                                 }
                                 StreamChunk::ToolCall { name, arguments } => {
                                     calls.push(ToolCall { name, arguments });
+                                }
+                                StreamChunk::Usage(u) => {
+                                    let _ = tx.send(ChatEvent::Usage(u));
                                 }
                             },
                             // Provider finished (sent __provider_done__) or hit an error.
