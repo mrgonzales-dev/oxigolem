@@ -46,15 +46,30 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
                 KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     app.open_palette()
                 }
+                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    if app.ctrl_c() {
+                        return Ok(());
+                    }
+                }
                 code if app.modal.is_some() => app.modal_key(code),
-                KeyCode::BackTab => app.toggle_view(),
+                KeyCode::BackTab => {
+                    app.dismiss_toast();
+                    app.toggle_view();
+                }
                 KeyCode::Esc => return Ok(()),
-                KeyCode::Enter => app.run_command(),
+                KeyCode::Enter => {
+                    app.dismiss_toast();
+                    app.run_command();
+                }
                 KeyCode::Backspace => {
+                    app.dismiss_toast();
                     app.pop_input();
                 }
                 KeyCode::Char('q') if app.is_input_empty() => return Ok(()),
-                KeyCode::Char(c) => app.push_char(c),
+                KeyCode::Char(c) => {
+                    app.dismiss_toast();
+                    app.push_char(c);
+                }
                 _ => {}
             },
             _ => {}
@@ -84,5 +99,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     if let Some(m) = &app.modal {
         ui::modal::draw(f, area, m, &app.modal_items());
+    }
+
+    if let Some(t) = &app.toast {
+        ui::toast::draw(f, area, t);
     }
 }

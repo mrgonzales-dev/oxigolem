@@ -27,6 +27,7 @@ pub struct App {
     pub term_lines: Vec<String>,
     pub modal: Option<Modal>,
     pub connected: Option<Connection>,
+    pub toast: Option<String>,
     providers: Vec<Box<dyn Provider>>,
 }
 
@@ -39,12 +40,32 @@ impl App {
             term_lines: vec!["oxigolem terminal — type a command below".to_string()],
             modal: None,
             connected: None,
+            toast: None,
             providers: provider::registry(),
         }
     }
 
     pub fn open_palette(&mut self) {
         self.modal = Some(Modal::new(Kind::Palette));
+    }
+
+    /// Handle Ctrl+C. Returns true if the app should quit.
+    pub fn ctrl_c(&mut self) -> bool {
+        if !self.is_input_empty() {
+            self.parts.clear();
+            self.toast = None;
+            false
+        } else if self.toast.is_some() {
+            true
+        } else {
+            self.toast = Some("Press Ctrl+C again to exit".to_string());
+            false
+        }
+    }
+
+    /// Dismiss the toast if it is showing (called on any non-Ctrl+C key).
+    pub fn dismiss_toast(&mut self) {
+        self.toast = None;
     }
 
     /// Items of the open modal, narrowed by its filter.
