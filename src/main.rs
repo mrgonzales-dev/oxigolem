@@ -1,10 +1,15 @@
 mod app;
+mod modal;
+mod provider;
 mod theme;
 mod ui;
 
 use app::{App, View};
 use crossterm::{
-    event::{self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -36,8 +41,12 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
         terminal.draw(|f| draw(f, &app))?;
 
         match event::read()? {
-            Event::Paste(text) => app.push_paste(text),
+            Event::Paste(text) if app.modal.is_none() => app.push_paste(text),
             Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                    app.open_palette()
+                }
+                code if app.modal.is_some() => app.modal_key(code),
                 KeyCode::BackTab => app.toggle_view(),
                 KeyCode::Esc => return Ok(()),
                 KeyCode::Enter => app.run_command(),
@@ -71,5 +80,9 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     }
 
     ui::input::draw(f, root[1], &app.input_display());
-    ui::header::draw(f, root[2], app.view);
+    ui::header::draw(f, root[2], app.view, app.connected.as_ref());
+
+    if let Some(m) = &app.modal {
+        ui::modal::draw(f, area, m, &app.modal_items());
+    }
 }

@@ -1,5 +1,12 @@
 use std::process::Command;
 
+use crossterm::event::KeyCode;
+
+use crate::{
+    modal::{Connection, Kind, Modal},
+    provider::{self, Provider},
+};
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum View {
     Agent,
@@ -18,6 +25,9 @@ pub struct App {
     parts: Vec<InputPart>,
     next_paste_id: usize,
     pub term_lines: Vec<String>,
+    pub modal: Option<Modal>,
+    pub connected: Option<Connection>,
+    providers: Vec<Box<dyn Provider>>,
 }
 
 impl App {
@@ -27,7 +37,80 @@ impl App {
             parts: Vec::new(),
             next_paste_id: 1,
             term_lines: vec!["oxigolem terminal — type a command below".to_string()],
+            modal: None,
+            connected: None,
+            providers: provider::registry(),
         }
+    }
+
+    pub fn open_palette(&mut self) {
+        self.modal = Some(Modal::new(Kind::Palette));
+    }
+
+    /// Items of the open modal, narrowed by its filter.
+    pub fn modal_items(&self) -> Vec<String> {
+        let Some(m) = &self.modal else { return Vec::new() };
+        let all: Vec<String> = match &m.kind {
+            Kind::Palette => vec!["Connect provider".to_string()],
+            Kind::Providers => self.providers.iter().map(|p| p.name().to_string()).collect(),
+            Kind::Models { models, .. } => models.clone(),
+            Kind::Message(_) => Vec::new(),
+        };
+        let f = m.filter.to_lowercase();
+        all.into_iter().filter(|i| i.to_lowercase().contains(&f)).collect()
+    }
+
+    pub fn modal_key(&mut self, code: KeyCode) {
+        let items = self.modal_items();
+        let Some(m) = self.modal.as_mut() else { return };
+        match code {
+            KeyCode::Esc => self.modal = None,
+            KeyCode::Up => m.sel = m.sel.saturating_sub(1),
+            KeyCode::Down => {
+                if m.sel + 1 < items.len() {
+                    m.sel += 1;
+                }
+            }
+            KeyCode::Backspace => {
+                m.filter.pop();
+                m.sel = 0;
+            }
+            KeyCode::Char(c) => {
+                m.filter.push(c);
+                m.sel = 0;
+            }
+            KeyCode::Enter => self.modal_select(items),
+            _ => {}
+        }
+    }
+
+    fn modal_select(&mut self, items: Vec<String>) {
+        let Some(m) = self.modal.take() else { return };
+        if matches!(m.kind, Kind::Message(_)) {
+            return;
+        }
+        let Some(choice) = items.get(m.sel).cloned() else {
+            self.modal = Some(m);
+            return;
+        };
+        self.modal = match m.kind {
+            Kind::Palette => Some(Modal::new(Kind::Providers)),
+            Kind::Providers => {
+                let idx = self.providers.iter().position(|p| p.name() == choice);
+                idx.map(|i| match self.providers[i].list_models() {
+                    Ok(models) => Modal::new(Kind::Models { provider: i, models }),
+                    Err(e) => Modal::new(Kind::Message(e)),
+                })
+            }
+            Kind::Models { provider, .. } => {
+                self.connected = Some(Connection {
+                    provider: self.providers[provider].name(),
+                    model: choice,
+                });
+                None
+            }
+            Kind::Message(_) => None,
+        };
     }
 
     pub fn toggle_view(&mut self) {
