@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::Rect,
     style::Style,
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::{
@@ -34,7 +34,10 @@ pub fn draw(
         .iter()
         .map(|l| {
             if let Some(err) = l.strip_prefix("! ") {
-                Line::from(Span::styled(format!("! {err}"), Style::default().fg(ORANGE)))
+                Line::from(Span::styled(
+                    format!("! {err}"),
+                    Style::default().fg(ORANGE),
+                ))
             } else {
                 Line::from(Span::styled(l.clone(), Style::default().fg(TEXT)))
             }

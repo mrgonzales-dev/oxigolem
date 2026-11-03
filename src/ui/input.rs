@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::theme::{FAINT, ORANGE, TEXT};
@@ -29,10 +29,7 @@ pub fn height_for(input: &str, width: u16) -> u16 {
 /// prefixing the first with "❯ ".
 fn wrapped_tail(input: &str, usable: usize, max: usize) -> Vec<String> {
     let chars: Vec<char> = input.chars().collect();
-    let mut lines: Vec<String> = chars
-        .chunks(usable)
-        .map(|c| c.iter().collect())
-        .collect();
+    let mut lines: Vec<String> = chars.chunks(usable).map(|c| c.iter().collect()).collect();
     if lines.is_empty() {
         lines.push(String::new());
     }
@@ -56,7 +53,10 @@ pub fn draw(f: &mut Frame, area: Rect, input: &str, tick: u64, slash_prefix_len:
 
     if input.is_empty() {
         content.push(Line::from(vec![
-            Span::styled("❯ ", Style::default().fg(ORANGE).add_modifier(Modifier::BOLD)),
+            Span::styled(
+                "❯ ",
+                Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
+            ),
             Span::styled(cursor, cursor_style),
             Span::styled(" type a command…", Style::default().fg(FAINT)),
         ]));

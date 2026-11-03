@@ -1,9 +1,9 @@
 use ratatui::{
+    Frame,
     layout::{Constraint, Flex, Layout, Rect},
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Clear, Paragraph, Wrap},
-    Frame,
 };
 
 use crate::{
@@ -58,7 +58,10 @@ pub fn draw(f: &mut Frame, area: Rect, modal: &Modal, items: &[String]) {
     ];
 
     if items.is_empty() {
-        lines.push(Line::from(Span::styled("no matches", Style::default().fg(FAINT))));
+        lines.push(Line::from(Span::styled(
+            "no matches",
+            Style::default().fg(FAINT),
+        )));
     }
     // Keep the selected row inside the 10-row window.
     let start = modal.sel.saturating_sub(9);

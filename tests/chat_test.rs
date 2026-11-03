@@ -32,7 +32,7 @@ impl Provider for MockProvider {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         "mock"
     }
 
@@ -64,7 +64,7 @@ impl Provider for ScriptedProvider {
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
-fn name(&self) -> &'static str {
+    fn name(&self) -> &'static str {
         "scripted"
     }
     fn list_models(&self) -> Result<Vec<String>, String> {
@@ -160,7 +160,7 @@ fn chat_engine_propagates_error() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "error"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -209,7 +209,11 @@ fn engine_executes_tool_call_and_continues() {
     let events = engine.poll();
 
     // Tool call + result events surfaced.
-    assert!(events.iter().any(|e| matches!(e, ChatEvent::ToolCall { name, .. } if name == "bash")));
+    assert!(
+        events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::ToolCall { name, .. } if name == "bash"))
+    );
     let result = events.iter().find_map(|e| match e {
         ChatEvent::ToolResult { outcome, .. } => Some(outcome.result.stdout.clone()),
         _ => None,
@@ -240,7 +244,7 @@ fn engine_stops_at_iteration_cap() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "always"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -267,7 +271,9 @@ fn name(&self) -> &'static str {
     std::thread::sleep(Duration::from_millis(2000));
     let events = engine.poll();
     assert!(
-        events.iter().any(|e| matches!(e, ChatEvent::Done(_) | ChatEvent::Error(_))),
+        events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Done(_) | ChatEvent::Error(_))),
         "engine must terminate at the iteration cap"
     );
     assert!(!engine.is_busy());
@@ -276,9 +282,7 @@ fn name(&self) -> &'static str {
 /// Spawn a fake Ollama `/api/chat` server on a local port.
 /// Returns the base URL (e.g. "http://127.0.0.1:PORT").
 /// `serve` is invoked with the connected stream after the request is read.
-fn fake_ollama(
-    serve: impl FnOnce(&mut std::net::TcpStream) + Send + 'static,
-) -> String {
+fn fake_ollama(serve: impl FnOnce(&mut std::net::TcpStream) + Send + 'static) -> String {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let port = listener.local_addr().unwrap().port();
     std::thread::spawn(move || {
@@ -373,7 +377,13 @@ fn ollama_sends_tools_in_request() {
     });
     let provider = Ollama::new(format!("http://127.0.0.1:{port}"));
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|_| {})
+        .chat(
+            "m",
+            &test_messages(),
+            &oxigolem::agent::tools::specs(),
+            &ChatOptions::default(),
+            &|_| {},
+        )
         .unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let json_start = req.find('{').unwrap();
@@ -396,11 +406,17 @@ fn ollama_parses_tool_calls_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|c| {
-            if !matches!(c, StreamChunk::Usage(_)) {
-                chunks.borrow_mut().push(c)
-            }
-        })
+        .chat(
+            "m",
+            &test_messages(),
+            &oxigolem::agent::tools::specs(),
+            &ChatOptions::default(),
+            &|c| {
+                if !matches!(c, StreamChunk::Usage(_)) {
+                    chunks.borrow_mut().push(c)
+                }
+            },
+        )
         .unwrap();
     assert_eq!(
         *chunks.borrow(),
@@ -426,11 +442,17 @@ fn ollama_parses_tool_calls_on_done_chunk() {
     let provider = Ollama::new(host);
     let chunks = RefCell::new(Vec::new());
     provider
-        .chat("m", &test_messages(), &oxigolem::agent::tools::specs(), &ChatOptions::default(), &|c| {
-            if !matches!(c, StreamChunk::Usage(_)) {
-                chunks.borrow_mut().push(c)
-            }
-        })
+        .chat(
+            "m",
+            &test_messages(),
+            &oxigolem::agent::tools::specs(),
+            &ChatOptions::default(),
+            &|c| {
+                if !matches!(c, StreamChunk::Usage(_)) {
+                    chunks.borrow_mut().push(c)
+                }
+            },
+        )
         .unwrap();
     assert_eq!(
         *chunks.borrow(),
@@ -470,11 +492,16 @@ fn ollama_serializes_tool_messages_back() {
         assistant,
         Message::tool("bash", "file.rs"),
     ];
-    provider.chat("m", &msgs, &[], &ChatOptions::default(), &|_| {}).unwrap();
+    provider
+        .chat("m", &msgs, &[], &ChatOptions::default(), &|_| {})
+        .unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
     let json_start = req.find('{').unwrap();
     let v: serde_json::Value = serde_json::from_str(&req[json_start..]).unwrap();
-    assert_eq!(v["messages"][1]["tool_calls"][0]["function"]["name"], "bash");
+    assert_eq!(
+        v["messages"][1]["tool_calls"][0]["function"]["name"],
+        "bash"
+    );
     assert_eq!(v["messages"][2]["role"], "tool");
     assert_eq!(v["messages"][2]["name"], "bash");
     assert_eq!(v["messages"][2]["content"], "file.rs");
@@ -489,10 +516,7 @@ fn ollama_chat_no_total_stream_timeout() {
         let chunk = |c: &str| format!("{{\"message\":{{\"content\":\"{c}\"}}}}\n");
         let tail = "{\"done\":true}\n";
         let body = format!("{}{}{}", chunk("a"), chunk("b"), tail);
-        let head = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
-            body.len()
-        );
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
         stream.write_all(head.as_bytes()).unwrap();
         stream.write_all(chunk("a").as_bytes()).unwrap();
         stream.flush().unwrap();
@@ -564,13 +588,9 @@ fn ollama_chat_tolerates_abrupt_close_mid_stream() {
 
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
-    let res = provider.chat(
-        "m",
-        &test_messages(),
-        &[],
-        &ChatOptions::default(),
-        &|c| tokens.borrow_mut().push(c),
-    );
+    let res = provider.chat("m", &test_messages(), &[], &ChatOptions::default(), &|c| {
+        tokens.borrow_mut().push(c)
+    });
     assert!(res.is_ok(), "expected Ok, got {res:?}");
     assert_eq!(
         *tokens.borrow(),
@@ -629,6 +649,7 @@ fn app_thinking_and_reply_are_separate_entries() {
         outcome: None,
         expanded: false,
         done_tick: None,
+        call_tick: None,
     });
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();
     std::thread::sleep(Duration::from_millis(150));
@@ -659,6 +680,7 @@ fn app_tool_events_render_as_tool_entries() {
         outcome: None,
         expanded: false,
         done_tick: None,
+        call_tick: None,
     });
     app.chat.as_mut().unwrap().send("run it".into()).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -686,7 +708,7 @@ fn app_chat_error_goes_to_transcript() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "error"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -713,6 +735,7 @@ fn name(&self) -> &'static str {
         outcome: None,
         expanded: false,
         done_tick: None,
+        call_tick: None,
     });
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::Golem,
@@ -720,6 +743,7 @@ fn name(&self) -> &'static str {
         outcome: None,
         expanded: false,
         done_tick: None,
+        call_tick: None,
     });
     // Manually kick a send so an error is pending.
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();
@@ -748,7 +772,7 @@ fn enter_while_busy_queues_prompt() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -795,7 +819,7 @@ fn second_enter_force_sends_immediately() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -850,7 +874,7 @@ fn esc_cancels_in_flight_generation() {
         fn as_any(&self) -> &dyn std::any::Any {
             self
         }
-fn name(&self) -> &'static str {
+        fn name(&self) -> &'static str {
             "slow"
         }
         fn list_models(&self) -> Result<Vec<String>, String> {
@@ -1059,7 +1083,10 @@ fn fenced_mode_passes_plain_text_unchanged() {
     engine.set_fenced(true);
     engine.send("hi".into()).unwrap();
     for _ in 0..200 {
-        let done = engine.poll().iter().any(|e| matches!(e, ChatEvent::Done(_)));
+        let done = engine
+            .poll()
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Done(_)));
         if done {
             return;
         }

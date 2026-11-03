@@ -148,7 +148,7 @@ impl Shell {
                     duration: started.elapsed(),
                     timed_out: false,
                     error: Some(format!("spawn failed: {e}")),
-                }
+                };
             }
         };
         let pgid = child.id() as i32;
@@ -495,14 +495,8 @@ impl Shell {
                 BgStatus::Running => {}
                 BgStatus::Exited(code) => {
                     return Some(ShellResult {
-                        stdout: read_capped(
-                            std::path::Path::new(&bg.log_path),
-                            MAX_CAPTURE,
-                        ),
-                        stderr: read_capped(
-                            std::path::Path::new(&bg.err_path),
-                            MAX_CAPTURE,
-                        ),
+                        stdout: read_capped(std::path::Path::new(&bg.log_path), MAX_CAPTURE),
+                        stderr: read_capped(std::path::Path::new(&bg.err_path), MAX_CAPTURE),
                         code: Some(code),
                         duration: started.elapsed(),
                         timed_out: false,
@@ -511,14 +505,8 @@ impl Shell {
                 }
                 BgStatus::Killed => {
                     return Some(ShellResult {
-                        stdout: read_capped(
-                            std::path::Path::new(&bg.log_path),
-                            MAX_CAPTURE,
-                        ),
-                        stderr: read_capped(
-                            std::path::Path::new(&bg.err_path),
-                            MAX_CAPTURE,
-                        ),
+                        stdout: read_capped(std::path::Path::new(&bg.log_path), MAX_CAPTURE),
+                        stderr: read_capped(std::path::Path::new(&bg.err_path), MAX_CAPTURE),
                         code: None,
                         duration: started.elapsed(),
                         timed_out: true,

@@ -112,9 +112,9 @@ pub fn kv_bytes_per_token(model_info: &serde_json::Value) -> Option<u64> {
     // Find the arch-prefixed namespace (e.g. "qwen3.*") by locating
     // any key that ends with ".block_count".
     let obj = model_info.as_object()?;
-    let prefix = obj.keys().find_map(|k| {
-        k.strip_suffix(".block_count").map(|p| p.to_string())
-    })?;
+    let prefix = obj
+        .keys()
+        .find_map(|k| k.strip_suffix(".block_count").map(|p| p.to_string()))?;
     let get = |suffix: &str| obj.get(&format!("{prefix}{suffix}"))?.as_u64();
     let layers = get(".block_count")?;
     let kv_heads = get(".attention.head_count_kv")?;
@@ -133,9 +133,10 @@ pub fn kv_bytes_per_token(model_info: &serde_json::Value) -> Option<u64> {
 pub fn resolve_num_ctx(model_ctx: u64, avail_ram: u64, kv_per_token: Option<u64>) -> u64 {
     const FLOOR: u64 = 8192;
     if let Ok(v) = std::env::var("OXIGOLEM_NUM_CTX")
-        && let Ok(n) = v.trim().parse::<u64>() {
-            return n.max(FLOOR.min(n)); // env wins outright, even below floor
-        }
+        && let Ok(n) = v.trim().parse::<u64>()
+    {
+        return n.max(FLOOR.min(n)); // env wins outright, even below floor
+    }
     let budgeted = kv_per_token
         .and_then(|b| (avail_ram / 4).checked_div(b))
         .unwrap_or(0);
@@ -148,9 +149,13 @@ pub fn avail_ram_bytes() -> u64 {
     let text = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("MemAvailable:")
-            && let Some(kb) = rest.split_whitespace().next().and_then(|v| v.parse::<u64>().ok()) {
-                return kb * 1024;
-            }
+            && let Some(kb) = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse::<u64>().ok())
+        {
+            return kb * 1024;
+        }
     }
     8 << 30
 }
@@ -208,7 +213,11 @@ impl Ollama {
             context_length: get(".context_length"),
             capabilities: body["capabilities"]
                 .as_array()
-                .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|c| c.as_str().map(str::to_string))
+                        .collect()
+                })
                 .unwrap_or_default(),
             parameter_count: get(".parameter_count"),
             raw,
@@ -237,7 +246,11 @@ fn read_model_cache(model: &str) -> Option<ModelInfo> {
         context_length: e["context_length"].as_u64()?,
         capabilities: e["capabilities"]
             .as_array()
-            .map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| c.as_str().map(str::to_string))
+                    .collect()
+            })
             .unwrap_or_default(),
         parameter_count: e["parameter_count"].as_u64().unwrap_or(0),
         raw: e["model_info"].clone(),
@@ -245,7 +258,9 @@ fn read_model_cache(model: &str) -> Option<ModelInfo> {
 }
 
 fn write_model_cache(model: &str, info: &ModelInfo) {
-    let Some(path) = model_cache_path() else { return };
+    let Some(path) = model_cache_path() else {
+        return;
+    };
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())

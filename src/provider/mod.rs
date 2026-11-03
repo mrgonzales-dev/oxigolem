@@ -118,13 +118,17 @@ fn model_list_path() -> Option<std::path::PathBuf> {
 pub fn read_model_list(provider: &str) -> Option<Vec<String>> {
     let text = std::fs::read_to_string(model_list_path()?).ok()?;
     let v: serde_json::Value = serde_json::from_str(&text).ok()?;
-    v[provider]
-        .as_array()
-        .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())
+    v[provider].as_array().map(|a| {
+        a.iter()
+            .filter_map(|m| m.as_str().map(str::to_string))
+            .collect()
+    })
 }
 
 pub fn write_model_list(provider: &str, models: &[String]) {
-    let Some(path) = model_list_path() else { return };
+    let Some(path) = model_list_path() else {
+        return;
+    };
     let mut v: serde_json::Value = std::fs::read_to_string(&path)
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())

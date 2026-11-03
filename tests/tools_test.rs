@@ -1,17 +1,27 @@
 use oxigolem::agent::tools;
-use oxigolem::shell::{new_bg_shells, BgStatus, Shell};
-use std::sync::atomic::{AtomicBool, Ordering};
+use oxigolem::shell::{BgStatus, Shell, new_bg_shells};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 fn rig() -> (Shell, oxigolem::shell::BgShells, Arc<AtomicBool>) {
-    (Shell::new(), new_bg_shells(), Arc::new(AtomicBool::new(false)))
+    (
+        Shell::new(),
+        new_bg_shells(),
+        Arc::new(AtomicBool::new(false)),
+    )
 }
 
 #[test]
 fn bash_runs_command_and_captures_stdout() {
     let (sh, shells, demote) = rig();
-    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo hello"}));
+    let out = tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "echo hello"}),
+    );
     assert_eq!(out.result.stdout.trim(), "hello");
     assert_eq!(out.result.code, Some(0));
     assert_eq!(out.command, "echo hello");
@@ -52,7 +62,13 @@ fn bash_demote_returns_shell_id_not_kill() {
     let demote2 = Arc::clone(&demote);
     let sh2 = sh.clone();
     let h = std::thread::spawn(move || {
-        tools::execute(&sh2, &shells2, &demote2, "bash", &serde_json::json!({"command": "sleep 30"}))
+        tools::execute(
+            &sh2,
+            &shells2,
+            &demote2,
+            "bash",
+            &serde_json::json!({"command": "sleep 30"}),
+        )
     });
     for _ in 0..100 {
         if shells.lock().unwrap().len() == 1 {
@@ -62,7 +78,11 @@ fn bash_demote_returns_shell_id_not_kill() {
     }
     demote.store(true, Ordering::Relaxed);
     let out = h.join().expect("execute returned");
-    assert!(out.demoted, "outcome must flag demote, got: {:?}", out.result);
+    assert!(
+        out.demoted,
+        "outcome must flag demote, got: {:?}",
+        out.result
+    );
     // Shell survives — still running in the registry, not killed.
     let reg = shells.lock().unwrap();
     assert_eq!(reg.len(), 1);
@@ -177,7 +197,13 @@ fn bash_output_over_pipe_buffer_does_not_deadlock() {
     // write and this hits the 30s timeout instead of finishing in ms.
     let (sh, shells, demote) = rig();
     let start = std::time::Instant::now();
-    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "seq 1 20000"}));
+    let out = tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "seq 1 20000"}),
+    );
     assert!(
         start.elapsed() < std::time::Duration::from_secs(10),
         "big output should not stall near the timeout"
@@ -189,7 +215,13 @@ fn bash_output_over_pipe_buffer_does_not_deadlock() {
 #[test]
 fn small_output_stays_inline() {
     let (sh, shells, demote) = rig();
-    let out = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo hi"}));
+    let out = tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "echo hi"}),
+    );
     assert!(out.spilled.is_none(), "small output must not spill");
     let msg = out.to_tool_message();
     assert!(msg.contains("hi"), "got: {msg}");
@@ -209,8 +241,14 @@ fn large_output_spills_to_file_with_preview() {
         "bash",
         &serde_json::json!({"command": "seq 1 5000"}), // ~24KB → over the 4KB inline cap
     );
-    let path = out.spilled.clone().expect("large output should spill to a file");
-    assert!(std::path::Path::new(&path).exists(), "spill file must exist: {path}");
+    let path = out
+        .spilled
+        .clone()
+        .expect("large output should spill to a file");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "spill file must exist: {path}"
+    );
 
     // Full output preserved on disk — nothing lost.
     let disk = std::fs::read_to_string(&path).unwrap();
@@ -245,12 +283,20 @@ fn run_in_background_returns_immediately_with_id_and_log() {
         "bg spawn should return immediately"
     );
     assert_eq!(out.result.code, Some(0));
-    assert!(out.result.stdout.contains(".log"), "got: {}", out.result.stdout);
+    assert!(
+        out.result.stdout.contains(".log"),
+        "got: {}",
+        out.result.stdout
+    );
     // Shell registered.
     let reg = shells.lock().unwrap();
     assert_eq!(reg.len(), 1);
     assert!(reg[0].log_path.ends_with(&format!("{}.log", reg[0].id)));
-    assert!(out.result.stdout.contains(&reg[0].id), "got: {}", out.result.stdout);
+    assert!(
+        out.result.stdout.contains(&reg[0].id),
+        "got: {}",
+        out.result.stdout
+    );
     // Still running.
     assert_eq!(reg[0].status(), BgStatus::Running);
 }
@@ -324,9 +370,17 @@ fn demote_turns_foreground_call_into_bg_shell() {
     // Demoted → early return carrying the shell id + log path.
     assert_eq!(out.result.code, Some(0));
     assert!(out.demoted, "outcome must flag demote");
-    assert!(out.result.stdout.contains("still running"), "got: {}", out.result.stdout);
+    assert!(
+        out.result.stdout.contains("still running"),
+        "got: {}",
+        out.result.stdout
+    );
     let id = shells.lock().unwrap()[0].id.clone();
-    assert!(out.result.stdout.contains(&id), "got: {}", out.result.stdout);
+    assert!(
+        out.result.stdout.contains(&id),
+        "got: {}",
+        out.result.stdout
+    );
     // Shell stays in the registry, no longer transient, still running.
     let reg = shells.lock().unwrap();
     assert_eq!(reg.len(), 1);
@@ -339,7 +393,13 @@ fn demote_turns_foreground_call_into_bg_shell() {
 #[test]
 fn foreground_shell_removed_from_registry_on_exit() {
     let (sh, shells, demote) = rig();
-    let _ = tools::execute(&sh, &shells, &demote, "bash", &serde_json::json!({"command": "echo x"}));
+    let _ = tools::execute(
+        &sh,
+        &shells,
+        &demote,
+        "bash",
+        &serde_json::json!({"command": "echo x"}),
+    );
     // Foreground (transient) shells are removed once execute finishes.
     assert_eq!(shells.lock().unwrap().len(), 0);
 }

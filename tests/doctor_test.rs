@@ -240,7 +240,10 @@ fn connect_flow_reaches_models_loading_then_models() {
         }
     }
     assert!(
-        !matches!(app.modal.as_ref().map(|m| &m.kind), Some(Kind::ModelsLoading { .. })),
+        !matches!(
+            app.modal.as_ref().map(|m| &m.kind),
+            Some(Kind::ModelsLoading { .. })
+        ),
         "loading must resolve within the pump budget"
     );
 }

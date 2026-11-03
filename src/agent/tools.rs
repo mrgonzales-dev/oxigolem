@@ -193,19 +193,41 @@ fn jobs_dir() -> Option<String> {
 /// the whole string carries no redirection/subshell metachars. The
 /// first word of each `|`-separated stage is checked; flags are free.
 const BATCHABLE_VERBS: &[&str] = &[
-    "grep", "rg", "cat", "ls", "sed", "head", "tail", "wc", "find", "git", "cargo", "pwd",
-    "echo", "printf", "env", "uname", "df", "du", "free", "ps", "date", "which", "whoami",
-    "hostname", "file", "stat", "tree",
+    "grep", "rg", "cat", "ls", "sed", "head", "tail", "wc", "find", "git", "cargo", "pwd", "echo",
+    "printf", "env", "uname", "df", "du", "free", "ps", "date", "which", "whoami", "hostname",
+    "file", "stat", "tree",
 ];
 
 /// Git subcommands that don't mutate the repo or the index.
-const BATCHABLE_GIT: &[&str] = &["status", "log", "diff", "grep", "show", "blame", "ls-files",
-    "branch", "tag", "rev-parse", "describe", "shortlog", "stash", "remote"];
+const BATCHABLE_GIT: &[&str] = &[
+    "status",
+    "log",
+    "diff",
+    "grep",
+    "show",
+    "blame",
+    "ls-files",
+    "branch",
+    "tag",
+    "rev-parse",
+    "describe",
+    "shortlog",
+    "stash",
+    "remote",
+];
 
 /// Cargo subcommands that only read/build — `check`/`test`/`metadata`
 /// write target/ but never touch source; the parallelism is safe.
-const BATCHABLE_CARGO: &[&str] = &["check", "test", "metadata", "tree", "search", "version",
-    "pkgid", "verify-project"];
+const BATCHABLE_CARGO: &[&str] = &[
+    "check",
+    "test",
+    "metadata",
+    "tree",
+    "search",
+    "version",
+    "pkgid",
+    "verify-project",
+];
 
 /// Metachars that make a command unsafe to batch: redirection, command
 /// substitution, backgrounding, sequencing. `|` is handled separately
@@ -222,7 +244,9 @@ pub fn batchable(cmd: &str) -> bool {
     }
     for stage in cmd.split('|') {
         let mut words = stage.split_whitespace();
-        let Some(verb) = words.next() else { return false };
+        let Some(verb) = words.next() else {
+            return false;
+        };
         // Strip path prefixes ("/bin/ls" → "ls") and env assignments
         // ("FOO=1 ls" handled by checking for '=' before the verb).
         if verb.contains('=') {
@@ -236,7 +260,10 @@ pub fn batchable(cmd: &str) -> bool {
             "sed" => {
                 // Only `sed -n` (print) — bare `sed s/…/` streams edits
                 // to stdout so it's also safe, but `-i` writes in place.
-                if stage.split_whitespace().any(|w| w == "-i" || w.starts_with("-i")) {
+                if stage
+                    .split_whitespace()
+                    .any(|w| w == "-i" || w.starts_with("-i"))
+                {
                     return false;
                 }
             }
@@ -308,9 +335,11 @@ pub fn execute(
             // — so concurrent execute calls can never collide on a
             // filename in a shared jobs dir.
             let id = {
-                static NEXT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(1);
-                format!("sh{}", NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+                static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+                format!(
+                    "sh{}",
+                    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                )
             };
             let spawned = shell.spawn_bg(&id, &cmd, &jobs, !bg);
             let bgshell = match spawned {

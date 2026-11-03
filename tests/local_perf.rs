@@ -13,7 +13,7 @@ use std::time::Duration;
 
 use oxigolem::{
     agent::chat::{ChatEngine, ChatEvent},
-    provider::{ollama::Ollama, ChatOptions, Provider, Usage},
+    provider::{ChatOptions, Provider, Usage, ollama::Ollama},
 };
 
 fn ollama_up() -> bool {
@@ -118,5 +118,9 @@ fn ten_turn_session_perf_table() {
         sum_tps += u.tokens_per_sec();
         n += 1;
     }
-    println!("── avg: {:.1}% cached · {:.1} t/s", sum_cached / n as f64, sum_tps / n as f64);
+    println!(
+        "── avg: {:.1}% cached · {:.1} t/s",
+        sum_cached / n as f64,
+        sum_tps / n as f64
+    );
 }

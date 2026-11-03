@@ -166,9 +166,7 @@ mod t {
 
     #[test]
     fn unknown_tool_envelope_rejected() {
-        assert!(
-            recover("{\"name\": \"get_weather\", \"arguments\": {}}", &["bash"]).is_none()
-        );
+        assert!(recover("{\"name\": \"get_weather\", \"arguments\": {}}", &["bash"]).is_none());
     }
 
     #[test]

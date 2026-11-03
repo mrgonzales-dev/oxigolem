@@ -1,7 +1,7 @@
 use std::sync::mpsc::Receiver;
 use std::sync::{
-    atomic::{AtomicBool, Ordering},
     Arc,
+    atomic::{AtomicBool, Ordering},
 };
 use std::thread;
 
@@ -10,7 +10,7 @@ use super::{
     tools::{self, ToolOutcome},
 };
 use crate::provider::{ChatOptions, Provider, StreamChunk, Usage};
-use crate::shell::{new_bg_shells, BgShells, Shell};
+use crate::shell::{BgShells, Shell, new_bg_shells};
 
 /// A tool call requested by the model (Ollama `message.tool_calls` shape).
 #[derive(Clone, Debug, PartialEq)]
@@ -66,11 +66,17 @@ pub enum ChatEvent {
     /// Reasoning text, rendered in its own dimmed block.
     Thinking(String),
     /// The model asked to run a tool — UI shows it as a `⎿ $ cmd` line.
-    ToolCall { name: String, args: serde_json::Value },
+    ToolCall {
+        name: String,
+        args: serde_json::Value,
+    },
     /// Tool finished — carries the structured outcome so the UI can
     /// render a cursor-cli-style block (cmd + stdout + stderr + code +
     /// duration) instead of a pre-flattened string.
-    ToolResult { name: String, outcome: ToolOutcome },
+    ToolResult {
+        name: String,
+        outcome: ToolOutcome,
+    },
     /// Generation finished. Carries every message appended this round
     /// (assistant replies + tool results) so history stays complete.
     Done(Vec<Message>),
@@ -308,8 +314,7 @@ impl ChatEngine {
                                     calls.push(ToolCall { name, arguments });
                                 }
                                 StreamChunk::Usage(u) => {
-                                    last_prompt_slot_worker
-                                        .store(u.prompt, Ordering::Relaxed);
+                                    last_prompt_slot_worker.store(u.prompt, Ordering::Relaxed);
                                     let _ = tx.send(ChatEvent::Usage(u));
                                 }
                             },
@@ -358,10 +363,7 @@ impl ChatEngine {
                             tools::execute(&shell, &shells, &demote, &call.name, &call.arguments)
                         }))
                         .unwrap_or_else(|_| tools::ToolOutcome {
-                            command: call.arguments["command"]
-                                .as_str()
-                                .unwrap_or("")
-                                .to_string(),
+                            command: call.arguments["command"].as_str().unwrap_or("").to_string(),
                             result: crate::shell::ShellResult {
                                 stdout: String::new(),
                                 stderr: String::new(),
@@ -432,9 +434,7 @@ impl ChatEngine {
                         appended.push(tm);
                     }
                 }
-                Err(format!(
-                    "agent loop hit the {MAX_ITERATIONS}-iteration cap"
-                ))
+                Err(format!("agent loop hit the {MAX_ITERATIONS}-iteration cap"))
             })();
             match result {
                 Ok(()) => {
@@ -476,7 +476,9 @@ impl ChatEngine {
 
     /// Drain all pending events. Called every event-loop iteration.
     pub fn poll(&mut self) -> Vec<ChatEvent> {
-        let Some(rx) = &self.rx else { return Vec::new() };
+        let Some(rx) = &self.rx else {
+            return Vec::new();
+        };
         let mut events = Vec::new();
         while let Ok(ev) = rx.try_recv() {
             let terminal = matches!(
@@ -543,12 +545,18 @@ fn session_path() -> Option<std::path::PathBuf> {
 /// Load the previous session's history, if any. Corrupt or missing
 /// files just start a fresh session.
 pub fn load_session() -> Vec<Message> {
-    let Some(path) = session_path() else { return Vec::new() };
-    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Some(path) = session_path() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
         return Vec::new();
     };
-    let Some(arr) = v.as_array() else { return Vec::new() };
+    let Some(arr) = v.as_array() else {
+        return Vec::new();
+    };
     arr.iter()
         .filter_map(|m| {
             let role = m["role"].as_str()?.to_string();

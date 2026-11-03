@@ -1,17 +1,17 @@
-use oxigolem::app::{App, View};
-use oxigolem::ui;
 use crossterm::{
     event::{
-        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste,
-        EnableMouseCapture, Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
+        self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, KeyModifiers, MouseEventKind,
     },
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use oxigolem::app::{App, View};
+use oxigolem::ui;
 use ratatui::{
+    Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
-    Terminal,
 };
 use std::io;
 use std::time::Duration;
@@ -19,7 +19,12 @@ use std::time::Duration;
 fn main() -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableBracketedPaste, EnableMouseCapture)?;
+    execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        EnableMouseCapture
+    )?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -132,11 +137,8 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
     let root = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Min(0),    // body
-            Constraint::Length(ui::input::height_for(
-                &app.input_display(),
-                area.width,
-            )), // input (grows downward)
+            Constraint::Min(0), // body
+            Constraint::Length(ui::input::height_for(&app.input_display(), area.width)), // input (grows downward)
             Constraint::Length(2), // footer status bar
         ])
         .split(area);
@@ -157,6 +159,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
             app.tick,
             app.scroll_back,
             app.gen_done_tick,
+            app.stream_tick,
             &app.shells,
             &app.last_log_bottom,
         ),

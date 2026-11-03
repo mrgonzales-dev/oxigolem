@@ -1,11 +1,11 @@
 use std::sync::atomic::Ordering;
 
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph},
-    Frame,
 };
 
 use crate::{
@@ -46,13 +46,20 @@ pub fn draw(
     // Brand chip — a soft shine sweeps left→right across the label
     // while connecting or generating (Claude-Code style). The text
     // itself never changes; only brightness moves. Idle = static.
-    let chip_label = if chip.connecting { "connecting" } else { "oxigolem" };
+    let chip_label = if chip.connecting {
+        "connecting"
+    } else {
+        "oxigolem"
+    };
     let mut spans: Vec<Span> = if chip.connecting || chip.busy {
         chip_spans(chip_label, chip.tick)
     } else {
         vec![Span::styled(
             " oxigolem ",
-            Style::default().fg(BG).bg(ORANGE).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(BG)
+                .bg(ORANGE)
+                .add_modifier(Modifier::BOLD),
         )]
     };
 
@@ -65,7 +72,11 @@ pub fn draw(
     // until the first done chunk lands.
     if let Some(u) = usage {
         spans.push(Span::styled(
-            format!("  · {:.1}% cached · {:.0} t/s", u.cached_pct(), u.tokens_per_sec()),
+            format!(
+                "  · {:.1}% cached · {:.0} t/s",
+                u.cached_pct(),
+                u.tokens_per_sec()
+            ),
             Style::default().fg(FAINT),
         ));
     }
@@ -106,7 +117,10 @@ pub fn draw(
     }
     drop(reg);
 
-    spans.push(Span::styled("   ctrl+p  shift+tab", Style::default().fg(FAINT)));
+    spans.push(Span::styled(
+        "   ctrl+p  shift+tab",
+        Style::default().fg(FAINT),
+    ));
 
     let header = Paragraph::new(Line::from(spans)).block(
         Block::default()
@@ -156,5 +170,9 @@ fn mix_rgb(a: ratatui::style::Color, b: ratatui::style::Color, k: f32) -> ratatu
         return a;
     };
     let m = |x: f32, y: f32| (x + (y - x) * k.clamp(0.0, 1.0)) as u8;
-    Color::Rgb(m(ar as f32, br as f32), m(ag as f32, bg_ as f32), m(ab as f32, bb as f32))
+    Color::Rgb(
+        m(ar as f32, br as f32),
+        m(ag as f32, bg_ as f32),
+        m(ab as f32, bb as f32),
+    )
 }

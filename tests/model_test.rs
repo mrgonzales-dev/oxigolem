@@ -1,5 +1,5 @@
 use oxigolem::agent::chat::Message;
-use oxigolem::provider::ollama::{kv_bytes_per_token, resolve_num_ctx, ModelInfo, Ollama};
+use oxigolem::provider::ollama::{ModelInfo, Ollama, kv_bytes_per_token, resolve_num_ctx};
 use oxigolem::provider::{ChatOptions, Provider};
 use std::io::{Read, Write};
 use std::net::TcpListener;
@@ -223,8 +223,7 @@ fn chat_options_think_true_serializes() {
         .chat("m", &test_messages(), &[], &opts, &|_| {})
         .unwrap();
     let req = rx.recv_timeout(Duration::from_secs(5)).unwrap();
-    let v: serde_json::Value =
-        serde_json::from_str(&req[req.find('{').unwrap()..]).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&req[req.find('{').unwrap()..]).unwrap();
     assert_eq!(v["think"], true);
 }
 

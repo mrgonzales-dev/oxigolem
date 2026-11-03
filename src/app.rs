@@ -9,7 +9,7 @@ use crate::{
     },
     modal::{Connection, Kind, Modal},
     provider::{self, Provider, Usage},
-    shell::{new_bg_shells, BgShells, Shell},
+    shell::{BgShells, Shell, new_bg_shells},
 };
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -50,6 +50,11 @@ pub struct TranscriptEntry {
     /// with a fading green shimmer for ~30 ticks so even sub-frame
     /// commands get a visible "streamed" beat instead of snapping.
     pub done_tick: Option<u64>,
+    /// Tick when the ToolCall arrived — the header reveals the
+    /// command progressively from this tick so it reads as the
+    /// model typing it instead of snapping in. Ollama delivers the
+    /// whole call in one chunk, so we synthesize the reveal.
+    pub call_tick: Option<u64>,
 }
 
 /// One segment of the input buffer: typed text or a paste chip.
@@ -100,6 +105,11 @@ pub struct App {
     /// Tick when the last generation finished — drives the shimmer→dim
     /// fade so thinking text eases out instead of snapping.
     pub gen_done_tick: Option<u64>,
+    /// Tick of the most recent streamed chunk (Token or Thinking).
+    /// The UI compares it against `tick` to spot a stalled stream —
+    /// the gap between "thinking finished" and "tool_call lands" —
+    /// and swaps the decode shimmer for a `calling bash` indicator.
+    pub stream_tick: u64,
     /// Token + timing counters from the most recent generation —
     /// the footer reads this for `cached%` and `t/s`. `None` until
     /// the first done chunk arrives.
@@ -111,7 +121,6 @@ pub struct App {
     tok_times: std::collections::VecDeque<std::time::Instant>,
     /// Chars seen since the last whole ~token (4 chars) was counted.
     tok_chars: usize,
-
 }
 
 impl App {
@@ -155,6 +164,7 @@ impl App {
             term_scroll: None,
             last_term_bottom: std::cell::Cell::new(0),
             gen_done_tick: None,
+            stream_tick: 0,
             last_usage: None,
             models_rx: None,
             tok_times: std::collections::VecDeque::new(),
@@ -239,7 +249,9 @@ impl App {
 
     /// Items of the open modal, narrowed by its filter.
     pub fn modal_items(&self) -> Vec<String> {
-        let Some(m) = &self.modal else { return Vec::new() };
+        let Some(m) = &self.modal else {
+            return Vec::new();
+        };
         let all: Vec<String> = match &m.kind {
             Kind::Palette => vec![
                 "Connect provider".to_string(),
@@ -247,15 +259,21 @@ impl App {
                 "/think — toggle reasoning on the live engine".to_string(),
                 "/clear — wipe transcript + session memory".to_string(),
             ],
-            Kind::Providers => self.providers.iter().map(|p| p.name().to_string()).collect(),
-            Kind::ModelsLoading { cached, .. } => {
-                cached.clone().unwrap_or_else(|| vec!["fetching…".to_string()])
-            }
+            Kind::Providers => self
+                .providers
+                .iter()
+                .map(|p| p.name().to_string())
+                .collect(),
+            Kind::ModelsLoading { cached, .. } => cached
+                .clone()
+                .unwrap_or_else(|| vec!["fetching…".to_string()]),
             Kind::Models { models, .. } => models.clone(),
             Kind::Message(_) => Vec::new(),
         };
         let f = m.filter.to_lowercase();
-        all.into_iter().filter(|i| i.to_lowercase().contains(&f)).collect()
+        all.into_iter()
+            .filter(|i| i.to_lowercase().contains(&f))
+            .collect()
     }
 
     pub fn modal_key(&mut self, code: KeyCode) {
@@ -318,7 +336,10 @@ impl App {
                         let _ = tx.send((i, p.list_models()));
                     });
                     self.models_rx = Some(rx);
-                    Modal::new(Kind::ModelsLoading { provider: i, cached })
+                    Modal::new(Kind::ModelsLoading {
+                        provider: i,
+                        cached,
+                    })
                 })
             }
             Kind::ModelsLoading { provider, .. } | Kind::Models { provider, .. } => {
@@ -347,10 +368,7 @@ impl App {
         });
         // Setup memory: remember this model so the next launch
         // reconnects directly instead of going through the palette.
-        crate::provider::ollama::config_set_default_model(
-            self.providers[i].name(),
-            &model,
-        );
+        crate::provider::ollama::config_set_default_model(self.providers[i].name(), &model);
         let mut engine = ChatEngine::with_all(
             Arc::clone(&p),
             model.clone(),
@@ -376,6 +394,7 @@ impl App {
                         outcome: None,
                         expanded: false,
                         done_tick: None,
+                        call_tick: None,
                     }),
                     "assistant" => {
                         if !m.content.is_empty() {
@@ -385,6 +404,7 @@ impl App {
                                 outcome: None,
                                 expanded: false,
                                 done_tick: None,
+                                call_tick: None,
                             });
                         }
                         if let Some(calls) = &m.tool_calls {
@@ -399,6 +419,7 @@ impl App {
                                     outcome: None,
                                     expanded: false,
                                     done_tick: None,
+                                    call_tick: None,
                                 });
                             }
                         }
@@ -423,6 +444,7 @@ impl App {
                             outcome: None,
                             expanded: false,
                             done_tick: None,
+                            call_tick: None,
                         });
                     }
                     _ => {} // system + unknown roles stay engine-only
@@ -434,8 +456,7 @@ impl App {
             match ollama.inspect(&model) {
                 Ok(info) => {
                     if !info.supports("tools") {
-                        self.toast =
-                            Some(format!("{model}: no tools capability — fenced mode"));
+                        self.toast = Some(format!("{model}: no tools capability — fenced mode"));
                         engine.set_fenced(true);
                     }
                     let kv = crate::provider::ollama::kv_bytes_per_token(&info.raw);
@@ -481,14 +502,20 @@ impl App {
         self.modal = Some(match res {
             Ok(models) => {
                 provider::write_model_list(self.providers[i].name(), &models);
-                Modal::new(Kind::Models { provider: i, models })
+                Modal::new(Kind::Models {
+                    provider: i,
+                    models,
+                })
             }
             Err(e) => {
                 let cached = provider::read_model_list(self.providers[i].name());
                 match cached {
                     Some(models) if !models.is_empty() => {
                         self.toast = Some(format!("offline — showing cached list ({e})"));
-                        Modal::new(Kind::Models { provider: i, models })
+                        Modal::new(Kind::Models {
+                            provider: i,
+                            models,
+                        })
                     }
                     _ => Modal::new(Kind::Message(e)),
                 }
@@ -556,6 +583,7 @@ impl App {
             outcome: None,
             expanded: true,
             done_tick: None,
+            call_tick: None,
         });
     }
 
@@ -588,7 +616,11 @@ impl App {
                 out.push_str(&format!("think    : {}\n", o.think));
                 out.push_str(&format!(
                     "tools    : {}\n",
-                    if engine.is_fenced() { "fenced repair" } else { "native" }
+                    if engine.is_fenced() {
+                        "fenced repair"
+                    } else {
+                        "native"
+                    }
                 ));
             }
             _ => {
@@ -732,10 +764,9 @@ impl App {
                 .map(|s| {
                     s.poked.store(true, std::sync::atomic::Ordering::Relaxed);
                     match s.status() {
-                        crate::shell::BgStatus::Exited(c) => format!(
-                            "[{} exited {c}]\nlog: {}",
-                            s.id, s.log_path
-                        ),
+                        crate::shell::BgStatus::Exited(c) => {
+                            format!("[{} exited {c}]\nlog: {}", s.id, s.log_path)
+                        }
                         _ => format!("[{} killed]\nlog: {}", s.id, s.log_path),
                     }
                 })
@@ -755,6 +786,7 @@ impl App {
             outcome: None,
             expanded: false,
             done_tick: None,
+            call_tick: None,
         });
         // Sending always snaps to the bottom — a manual pin would
         // otherwise hide the prompt + reply the user just triggered.
@@ -818,12 +850,18 @@ impl App {
         for ev in events {
             match ev {
                 ChatEvent::Thinking(t) => {
+                    self.stream_tick = self.tick;
                     Self::append_or_push(&mut self.transcript, Role::Thinking, t);
                 }
                 ChatEvent::Token(token) => {
+                    self.stream_tick = self.tick;
                     // First reply token after a thinking block starts the
                     // shimmer→dim fade immediately, not at Done.
-                    if self.transcript.last().is_some_and(|e| matches!(e.role, Role::Thinking)) {
+                    if self
+                        .transcript
+                        .last()
+                        .is_some_and(|e| matches!(e.role, Role::Thinking))
+                    {
                         self.gen_done_tick = Some(self.tick);
                     }
                     // Scope: one arrival record per ~token (chunks are
@@ -854,6 +892,7 @@ impl App {
                         outcome: None,
                         expanded: false,
                         done_tick: None,
+                        call_tick: Some(self.tick),
                     });
                 }
                 ChatEvent::ToolResult { name, outcome } => {
@@ -882,6 +921,7 @@ impl App {
                             outcome: Some(outcome),
                             expanded: false,
                             done_tick: Some(self.tick),
+                            call_tick: None,
                         }),
                     }
                 }
@@ -899,6 +939,7 @@ impl App {
                         outcome: None,
                         expanded: false,
                         done_tick: None,
+                        call_tick: None,
                     });
                     self.gen_done_tick = Some(self.tick);
                 }
@@ -924,6 +965,7 @@ impl App {
                         outcome: None,
                         expanded: false,
                         done_tick: None,
+                        call_tick: None,
                     });
                     self.toast = Some("chat failed — see transcript".to_string());
                 }
@@ -945,6 +987,7 @@ impl App {
             outcome: None,
             expanded: false,
             done_tick: None,
+            call_tick: None,
         });
     }
 

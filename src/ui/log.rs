@@ -1,17 +1,15 @@
 use ratatui::{
+    Frame,
     layout::Rect,
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Paragraph, Wrap},
-    Frame,
 };
 
 use crate::{
     app::{Role, TranscriptEntry},
     shell::BgShells,
-    theme::{
-        FAINT, LIVE_BASE, LIVE_HOT, ORANGE, ORANGE_DIM, TEXT, THINK_BASE, THINK_HOT, USER_BG,
-    },
+    theme::{FAINT, LIVE_BASE, LIVE_HOT, ORANGE, ORANGE_DIM, TEXT, THINK_BASE, THINK_HOT, USER_BG},
 };
 
 /// Claude Code-style transcript: no box, no borders. The assistant speaks
@@ -25,6 +23,7 @@ pub fn draw(
     tick: u64,
     scroll_back: Option<u16>,
     gen_done_tick: Option<u64>,
+    stream_tick: u64,
     shells: &BgShells,
     report_bottom: &std::cell::Cell<u16>,
 ) {
@@ -46,6 +45,21 @@ pub fn draw(
     let last_thinking = transcript
         .iter()
         .rposition(|e| matches!(e.role, Role::Thinking));
+
+    // Stalled-stream detection: while the engine is busy but no chunk
+    // has arrived for ~0.6s, the model is assembling something (usually
+    // a tool_call — Ollama delivers those in one piece at the end). In
+    // that gap we suppress the thinking decode animation and show a
+    // green "calling bash…" row instead.
+    const STALL_TICKS: u64 = 20; // ~1.0s at 50ms/tick — generous so a
+    // slow model's inter-chunk gap mid-thinking can't flicker it on
+    let stalled = thinking_live && tick.saturating_sub(stream_tick) > STALL_TICKS;
+    let last = transcript.last();
+    let calling_bash = stalled
+        && last.is_some_and(|e| {
+            matches!(e.role, Role::Thinking)
+                || (matches!(e.role, Role::Tool) && e.outcome.is_some())
+        });
 
     for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
@@ -75,7 +89,7 @@ pub fn draw(
                 // Only the most recent thinking block animates — earlier
                 // ones are always settled FAINT.
                 let fresh = Some(ei) == last_thinking;
-                let live = fresh && thinking_live && ei + 1 == transcript.len();
+                let live = fresh && thinking_live && ei + 1 == transcript.len() && !calling_bash;
                 // Fade shimmer → FAINT over ~20 ticks after generation ends.
                 let fade = if !fresh {
                     0.0
@@ -135,9 +149,7 @@ pub fn draw(
                         let mut prefixed = Line::default();
                         prefixed.spans.push(Span::styled(
                             pad.to_string() + marker,
-                            Style::default()
-                                .fg(ORANGE)
-                                .add_modifier(Modifier::BOLD),
+                            Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
                         ));
                         prefixed.spans.extend(sub);
                         lines.push(prefixed);
@@ -180,10 +192,7 @@ pub fn draw(
                 {
                     for l in entry.text.lines() {
                         lines.push(Line::from(vec![
-                            Span::styled(
-                                format!("{pad}  ⎿ "),
-                                Style::default().fg(ORANGE_DIM),
-                            ),
+                            Span::styled(format!("{pad}  ⎿ "), Style::default().fg(ORANGE_DIM)),
                             Span::styled(l.to_string(), Style::default().fg(FAINT)),
                         ]));
                     }
@@ -197,21 +206,39 @@ pub fn draw(
                     None => ("bash".to_string(), entry.text.clone()),
                 };
                 let in_flight = entry.outcome.is_none();
+
+                // Typewriter reveal — Ollama delivers the whole tool_call
+                // in one chunk, so we synthesize the stream: ~10 chars per
+                // tick (~200 chars/sec at 50 ms/tick) makes the command
+                // appear as if the model is typing it instead of snapping.
+                // Done entries skip the reveal (call cleared the stamp).
+                let shown_cmd: String = match (entry.call_tick, in_flight) {
+                    (Some(t0), true) => {
+                        let elapsed = tick.saturating_sub(t0) as usize;
+                        let n = (elapsed * 10).min(cmd.chars().count());
+                        cmd.chars().take(n).collect()
+                    }
+                    _ => cmd.clone(),
+                };
+                let revealing = entry.call_tick.is_some()
+                    && in_flight
+                    && shown_cmd.chars().count() < cmd.chars().count();
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{pad}● "),
-                        Style::default()
-                            .fg(ORANGE)
-                            .add_modifier(Modifier::BOLD),
+                        Style::default().fg(ORANGE).add_modifier(Modifier::BOLD),
                     ),
                     Span::styled(
                         tool_name,
                         Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
                     ),
-                    Span::styled(
-                        format!(" · $ {cmd}"),
-                        Style::default().fg(FAINT),
-                    ),
+                    Span::styled(format!(" · $ {shown_cmd}"), Style::default().fg(FAINT)),
+                    // Block cursor while the command is still revealing.
+                    if revealing {
+                        Span::styled("▌".to_string(), Style::default().fg(ORANGE))
+                    } else {
+                        Span::raw("")
+                    },
                 ]));
 
                 // Live body — while the call is in flight, tail the
@@ -225,8 +252,7 @@ pub fn draw(
                         let reg = shells.lock().unwrap();
                         reg.iter()
                             .find(|s| {
-                                s.transient
-                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                s.transient.load(std::sync::atomic::Ordering::Relaxed)
                                     && s.command == cmd
                                     && matches!(s.status(), crate::shell::BgStatus::Running)
                             })
@@ -265,10 +291,7 @@ pub fn draw(
                     let tail: Vec<&&String> = tail.iter().rev().collect();
                     let mut col = 0usize;
                     for l in tail {
-                        let mut spans = vec![Span::styled(
-                            format!("{pad}  "),
-                            Style::default(),
-                        )];
+                        let mut spans = vec![Span::styled(format!("{pad}  "), Style::default())];
                         for c in l.chars().take(line_cap) {
                             spans.push(Span::styled(
                                 c.to_string(),
@@ -281,10 +304,7 @@ pub fn draw(
                     if live.is_empty() {
                         lines.push(Line::from(vec![
                             Span::styled(format!("{pad}  "), Style::default()),
-                            Span::styled(
-                                "…".to_string(),
-                                Style::default().fg(shade_live(0, tick)),
-                            ),
+                            Span::styled("…".to_string(), Style::default().fg(shade_live(0, tick))),
                         ]));
                     }
                 }
@@ -302,12 +322,7 @@ pub fn draw(
                         ));
                     } else {
                         body.extend(out.result.stdout.lines().map(|l| l.to_string()));
-                        body.extend(
-                            out.result
-                                .stderr
-                                .lines()
-                                .map(|l| format!("! {l}")),
-                        );
+                        body.extend(out.result.stderr.lines().map(|l| format!("! {l}")));
                     }
                     let total = body.len();
 
@@ -338,10 +353,7 @@ pub fn draw(
                     let mut col = 0usize;
                     for l in show {
                         let clipped = if l.chars().count() > LINE_CAP {
-                            format!(
-                                "{} …",
-                                l.chars().take(LINE_CAP).collect::<String>()
-                            )
+                            format!("{} …", l.chars().take(LINE_CAP).collect::<String>())
                         } else {
                             l.clone()
                         };
@@ -351,9 +363,8 @@ pub fn draw(
                             for c in clipped.chars() {
                                 spans.push(Span::styled(
                                     c.to_string(),
-                                    Style::default().fg(shade_pair(
-                                        fade, col, tick, LIVE_BASE, LIVE_HOT,
-                                    )),
+                                    Style::default()
+                                        .fg(shade_pair(fade, col, tick, LIVE_BASE, LIVE_HOT)),
                                 ));
                                 col += 1;
                             }
@@ -425,14 +436,40 @@ pub fn draw(
         }
     }
 
+    // "Calling bash" — while the stream is stalled the model is most
+    // likely writing a tool_call (Ollama emits it in one chunk at the
+    // end). Show a green bash row in that gap so the wait reads as
+    // "tool incoming" instead of a dead transcript. When the real
+    // ToolCall lands, its `● bash · $ cmd` entry takes over from here.
+    if calling_bash {
+        // Animated dots — cycles … → blank so it reads as waiting.
+        let dots = ". ".repeat(((tick / 6) % 4) as usize);
+        let mut spans = vec![
+            Span::styled(
+                format!("{pad}● "),
+                Style::default().fg(LIVE_HOT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "bash",
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" · calling", Style::default().fg(FAINT)),
+        ];
+        for (i, c) in dots.chars().enumerate() {
+            spans.push(Span::styled(
+                c.to_string(),
+                Style::default().fg(shade_live(i, tick)),
+            ));
+        }
+        lines.push(Line::from(spans));
+        lines.push(Line::default());
+    }
+
     // Scroll is in wrapped visual rows — estimate each line's row cost at
     // the render width. `scroll_back` pins a manual offset from the bottom;
     // None follows the newest entry.
     let w = area.width.max(1) as usize;
-    let mut total: usize = lines
-        .iter()
-        .map(|l| (l.width().max(1)).div_ceil(w))
-        .sum();
+    let mut total: usize = lines.iter().map(|l| (l.width().max(1)).div_ceil(w)).sum();
 
     // Paragraph::scroll takes a u16 — a transcript past 65,535 rows
     // truncates the offset and the view locks near the top with the
@@ -452,10 +489,7 @@ pub fn draw(
         }
         dropped.extend(lines.drain(keep_from..));
         lines = dropped;
-        total = lines
-            .iter()
-            .map(|l| (l.width().max(1)).div_ceil(w))
-            .sum();
+        total = lines.iter().map(|l| (l.width().max(1)).div_ceil(w)).sum();
     }
 
     let bottom = total.saturating_sub(area.height as usize);
@@ -480,10 +514,7 @@ fn wrap_chars(s: &str, width: usize) -> Vec<String> {
     if chars.is_empty() {
         return vec![String::new()];
     }
-    chars
-        .chunks(width)
-        .map(|c| c.iter().collect())
-        .collect()
+    chars.chunks(width).map(|c| c.iter().collect()).collect()
 }
 
 /// Wrap styled spans at `width` display cells, splitting spans at cut
@@ -538,9 +569,9 @@ fn decode_char(real: char, col: usize, total: usize, tick: u64) -> char {
     // Still scrambling — pick a glyph from a matrix-flavoured set,
     // rehashing with tick so the char changes every frame.
     const GLYPHS: &[char] = &[
-        'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ', 'ｻ', 'ｼ', 'ｽ', 'ｾ', 'ｿ',
-        'ﾀ', 'ﾁ', 'ﾂ', 'ﾃ', 'ﾄ', 'ﾅ', 'ﾆ', 'ﾇ', 'ﾈ', 'ﾉ', 'ﾊ', 'ﾋ', 'ﾌ', 'ﾍ', 'ﾎ',
-        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '*', ':', '¦', '⟊',
+        'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ', 'ｻ', 'ｼ', 'ｽ', 'ｾ', 'ｿ', 'ﾀ', 'ﾁ', 'ﾂ',
+        'ﾃ', 'ﾄ', 'ﾅ', 'ﾆ', 'ﾇ', 'ﾈ', 'ﾉ', 'ﾊ', 'ﾋ', 'ﾌ', 'ﾍ', 'ﾎ', '0', '1', '2', '3', '4', '5',
+        '6', '7', '8', '9', '+', '*', ':', '¦', '⟊',
     ];
     let mut h2 = h.wrapping_add(tick as u32);
     h2 ^= h2 << 13;
@@ -569,9 +600,15 @@ fn shade_pair(fade: f32, col: usize, tick: u64, base: Color, hot: Color) -> Colo
     if fade <= 0.0 {
         return FAINT;
     }
-    let Color::Rgb(br, bg_, bb) = base else { return FAINT };
-    let Color::Rgb(hr, hg, hb) = hot else { return FAINT };
-    let Color::Rgb(fr, fg, fb) = FAINT else { return FAINT };
+    let Color::Rgb(br, bg_, bb) = base else {
+        return FAINT;
+    };
+    let Color::Rgb(hr, hg, hb) = hot else {
+        return FAINT;
+    };
+    let Color::Rgb(fr, fg, fb) = FAINT else {
+        return FAINT;
+    };
     // Slow drift: full sweep of the ~96-col window in ~24 s.
     let phase = (col as f32 - tick as f32 * 0.25) * (std::f32::consts::TAU / 96.0);
     // powf(3) on the upper half of the sine widens the bright blob and

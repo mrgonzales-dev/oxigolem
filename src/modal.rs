@@ -5,8 +5,14 @@ pub enum Kind {
     /// Fetching the model list on a worker thread — keeps the UI
     /// responsive when the provider is slow or down. `cached` carries
     /// the last known list so the picker can offer it if the fetch fails.
-    ModelsLoading { provider: usize, cached: Option<Vec<String>> },
-    Models { provider: usize, models: Vec<String> },
+    ModelsLoading {
+        provider: usize,
+        cached: Option<Vec<String>>,
+    },
+    Models {
+        provider: usize,
+        models: Vec<String>,
+    },
     Message(String),
 }
 
@@ -18,7 +24,11 @@ pub struct Modal {
 
 impl Modal {
     pub fn new(kind: Kind) -> Self {
-        Self { kind, filter: String::new(), sel: 0 }
+        Self {
+            kind,
+            filter: String::new(),
+            sel: 0,
+        }
     }
 
     pub fn title(&self) -> &'static str {

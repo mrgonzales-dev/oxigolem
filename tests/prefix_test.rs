@@ -84,10 +84,13 @@ fn serialize(m: &Message) -> String {
 fn wait_done(engine: &mut ChatEngine) {
     for _ in 0..100 {
         let evs = engine.poll();
-        if evs
-            .iter()
-            .any(|e| matches!(e, oxigolem::agent::chat::ChatEvent::Done(_) | oxigolem::agent::chat::ChatEvent::Error(_)))
-        {
+        if evs.iter().any(|e| {
+            matches!(
+                e,
+                oxigolem::agent::chat::ChatEvent::Done(_)
+                    | oxigolem::agent::chat::ChatEvent::Error(_)
+            )
+        }) {
             // Commit appended messages like the real app does.
             if let Some(msgs) = evs.iter().find_map(|e| match e {
                 oxigolem::agent::chat::ChatEvent::Done(m) => Some(m.clone()),
@@ -107,12 +110,10 @@ fn request_body_is_append_only_across_turns() {
     // Turn 1: plain answer. Turn 2: tool call + answer.
     let script = vec![
         vec![StreamChunk::Content("first answer".into())],
-        vec![
-            StreamChunk::ToolCall {
-                name: "bash".into(),
-                arguments: serde_json::json!({"command": "ls"}),
-            },
-        ],
+        vec![StreamChunk::ToolCall {
+            name: "bash".into(),
+            arguments: serde_json::json!({"command": "ls"}),
+        }],
         vec![StreamChunk::Content("second answer".into())],
     ];
     let (provider, seen) = RecordingProvider::scripted(script);
@@ -124,7 +125,11 @@ fn request_body_is_append_only_across_turns() {
     wait_done(&mut engine);
 
     let calls = seen.lock().unwrap();
-    assert!(calls.len() >= 3, "expected 3 provider calls, got {}", calls.len());
+    assert!(
+        calls.len() >= 3,
+        "expected 3 provider calls, got {}",
+        calls.len()
+    );
     // calls[0] = [system, user:q1]
     // calls[1] = [system, user:q1, asst, user:q2]
     // calls[2] = [system, user:q1, asst, user:q2, asst(tool_calls), tool]
@@ -189,7 +194,7 @@ fn tool_specs_do_not_appear_in_system_prompt() {
 
 #[test]
 fn budget_plan_compacts_once_then_stops() {
-    use oxigolem::agent::budget::{plan, Plan};
+    use oxigolem::agent::budget::{Plan, plan};
     let mut history: Vec<Message> = Vec::new();
     history.push(Message::user("seed"));
     for i in 0..50 {
@@ -226,7 +231,7 @@ fn budget_plan_compacts_once_then_stops() {
 
 #[test]
 fn budget_plan_keepall_when_under_budget() {
-    use oxigolem::agent::budget::{plan, Plan};
+    use oxigolem::agent::budget::{Plan, plan};
     let history = vec![Message::user("hi"), Message::assistant("hello".into())];
     assert!(matches!(plan(&history, 1_000_000, None), Plan::KeepAll));
 }
