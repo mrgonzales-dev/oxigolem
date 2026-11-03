@@ -593,9 +593,9 @@ fn shade_live(col: usize, tick: u64) -> Color {
 /// Color for one character of shimmered text. `fade` is 1.0 while the
 /// shimmer is fully on and 0.0 once it has eased back to FAINT.
 /// Lava-lamp feel: a wide sine window (period ~96 cols) drifts
-/// left→right at ~1 col / tick (a full sweep in ~4.8s at 50 ms/tick),
-/// and its amplitude is raised to a low power so the "blob" crest is
-/// wide and the troughs are broad — no sharp stripes.
+/// left→right at 4 cols / tick (a full sweep in ~1.2 s at 50 ms/tick —
+/// 4× from the 1 col/tick the user kept calling a glacier; powf(3)
+/// keeps the crest a blob even as it moves fast).
 fn shade_pair(fade: f32, col: usize, tick: u64, base: Color, hot: Color) -> Color {
     if fade <= 0.0 {
         return FAINT;
@@ -609,9 +609,10 @@ fn shade_pair(fade: f32, col: usize, tick: u64, base: Color, hot: Color) -> Colo
     let Color::Rgb(fr, fg, fb) = FAINT else {
         return FAINT;
     };
-    // Drift: full sweep of the ~96-col window in ~4.8 s — fast enough
-    // to read as movement, wide enough to stay a blob not a stripe.
-    let phase = (col as f32 - tick as f32) * (std::f32::consts::TAU / 96.0);
+    // Drift: 4 cols/tick — full sweep of the ~96-col window in ~1.2 s
+    // (4× from 1 col/tick). Fast, and powf(3) keeps it a blob not a
+    // stripe at speed.
+    let phase = (col as f32 - tick as f32 * 4.0) * (std::f32::consts::TAU / 96.0);
     // powf(3) on the upper half of the sine widens the bright blob and
     // flattens the trough — reads as a lava blob, not a stripe.
     let t = ((phase.sin() + 1.0) / 2.0).powf(3.0);
