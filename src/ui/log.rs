@@ -207,7 +207,7 @@ pub fn draw(
                     for l in show {
                         lines.push(Line::from(vec![
                             Span::styled(format!("{pad}  "), Style::default()),
-                            Span::styled(l.clone(), Style::default().fg(FAINT)),
+                            Span::styled(l.clone(), Style::default().fg(TEXT)),
                         ]));
                     }
                     if !entry.expanded && total > COLLAPSE_LINES {
