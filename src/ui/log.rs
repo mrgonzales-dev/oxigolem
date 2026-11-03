@@ -17,6 +17,8 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
     let pad = "  ";
+    // Extra indent for thinking/reply bodies past the marker.
+    let body = "  ";
 
     for entry in transcript {
         match entry.role {
@@ -46,7 +48,7 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
                     lines.push(Line::from(vec![
                         Span::styled(pad.to_string() + marker, Style::default().fg(FAINT)),
                         Span::styled(
-                            l.to_string(),
+                            format!("{body}{l}{body}"),
                             Style::default().fg(FAINT).add_modifier(Modifier::DIM),
                         ),
                     ]));
@@ -65,7 +67,9 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
                             .fg(ORANGE)
                             .add_modifier(Modifier::BOLD),
                     ));
+                    prefixed.spans.push(Span::raw(body));
                     prefixed.spans.extend(line.spans);
+                    prefixed.spans.push(Span::raw(body));
                     lines.push(prefixed);
                 }
                 lines.push(Line::default());
