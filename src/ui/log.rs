@@ -144,7 +144,7 @@ pub fn draw(
                 // an error line, not a fake `bash` call.
                 if entry.outcome.is_none()
                     && (entry.text.starts_with("chat error:")
-                        || entry.text.starts_with("chat cancelled"))
+                        || entry.text.starts_with("interrupted"))
                 {
                     for l in entry.text.lines() {
                         lines.push(Line::from(vec![

@@ -8,7 +8,14 @@ use std::time::{Duration, Instant};
 const TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Max output chars kept per command — head and tail with a gap marker.
+/// Used by `to_text` (the flat form for the terminal view + tool message
+/// preview). The full `stdout`/`stderr` fields keep up to MAX_CAPTURE.
 const MAX_OUTPUT: usize = 4000;
+
+/// Max bytes captured per stream from the child — bounds memory/disk for
+/// pathological dumps while keeping far more than the inline cap so
+/// large outputs can spill to a file intact.
+const MAX_CAPTURE: usize = 256 * 1024;
 
 /// Result of one command: raw streams plus exit/timeout metadata. The
 /// agent tool turns this into a `tool` message; the UI renders it as a
@@ -144,19 +151,30 @@ impl Shell {
         };
         let pgid = child.id() as i32;
 
-        let (tx, rx) = std::sync::mpsc::channel();
+        // Drain stdout/stderr on their own threads while the child runs.
+        // Waiting on exit BEFORE draining deadlocks past the 64KB pipe
+        // buffer: the child blocks on write, we block on wait, the 30s
+        // timeout kills it. Read-capped threads keep big outputs alive.
+        let (dtx, drx) = std::sync::mpsc::channel();
+        let mut so = child.stdout.take().unwrap();
+        let mut se = child.stderr.take().unwrap();
+        let ot = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = so.by_ref().take(MAX_CAPTURE as u64).read_to_end(&mut buf);
+            buf
+        });
+        let et = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            let _ = se.by_ref().take(MAX_CAPTURE as u64).read_to_end(&mut buf);
+            buf
+        });
         std::thread::spawn(move || {
             let status = child.wait();
-            let mut out = Vec::new();
-            let mut err = Vec::new();
-            if let Some(mut so) = child.stdout.take() {
-                let _ = so.read_to_end(&mut out);
-            }
-            if let Some(mut se) = child.stderr.take() {
-                let _ = se.read_to_end(&mut err);
-            }
-            let _ = tx.send((out, err, status.ok()));
+            let out = ot.join().unwrap_or_default();
+            let err = et.join().unwrap_or_default();
+            let _ = dtx.send((out, err, status.ok()));
         });
+        let rx = drx;
 
         let (out, err, status) = match rx.recv_timeout(TIMEOUT) {
             Ok(v) => v,

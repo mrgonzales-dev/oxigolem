@@ -836,9 +836,100 @@ fn esc_cancels_in_flight_generation() {
     // Poll until Cancelled arrives.
     std::thread::sleep(Duration::from_millis(400));
     app.poll_chat();
-    let cancelled = app
+    let interrupted = app
         .transcript
         .iter()
-        .any(|e| matches!(e.role, Role::Tool) && e.text.contains("cancelled"));
-    assert!(cancelled, "transcript should show a cancelled marker");
+        .any(|e| matches!(e.role, Role::Tool) && e.text.contains("interrupted"));
+    assert!(interrupted, "transcript should show an interrupted marker");
+}
+
+#[test]
+fn prune_stubs_old_tool_results() {
+    // History: user → tool output → assistant → user → tool output.
+    // Tool results older than the last user message get stubbed;
+    // the newest one stays full.
+    let history = vec![
+        Message::user("q1"),
+        Message::tool("bash", &"x".repeat(5000)),
+        Message::assistant("a1".into()),
+        Message::user("q2"),
+        Message::tool("bash", "recent full output"),
+        Message::assistant("a2".into()),
+    ];
+    let pruned = oxigolem::agent::chat::prune_history(&history);
+
+    // Older tool result stubbed — assistant tool_calls pairing intact.
+    assert!(pruned[1].content.contains("output omitted"), "old tool result should be stubbed, got: {}", pruned[1].content);
+    assert_eq!(pruned[1].role, "tool");
+    assert_eq!(pruned[1].name.as_deref(), Some("bash"));
+
+    // Newest tool result (before last assistant) still full.
+    assert_eq!(pruned[4].content, "recent full output");
+
+    // Non-tool messages untouched.
+    assert_eq!(pruned[0].content, "q1");
+    assert_eq!(pruned[2].content, "a1");
+    assert_eq!(pruned[3].content, "q2");
+    assert_eq!(pruned[5].content, "a2");
+}
+
+#[test]
+fn send_stubbs_old_tool_results_in_request() {
+    // Provider records the messages it was called with.
+    struct RecordingProvider {
+        seen: Mutex<Vec<Vec<Message>>>,
+    }
+    impl Provider for RecordingProvider {
+        fn name(&self) -> &'static str {
+            "rec"
+        }
+        fn list_models(&self) -> Result<Vec<String>, String> {
+            Ok(vec!["m".into()])
+        }
+        fn chat(
+            &self,
+            _model: &str,
+            messages: &[Message],
+            _tools: &[ToolSpec],
+            on_chunk: &dyn Fn(StreamChunk),
+        ) -> Result<(), String> {
+            self.seen.lock().unwrap().push(messages.to_vec());
+            on_chunk(StreamChunk::Content("ok".into()));
+            Ok(())
+        }
+    }
+
+    let provider = Arc::new(RecordingProvider { seen: Mutex::new(Vec::new()) });
+    let mut engine = ChatEngine::new(provider.clone(), "m".into());
+
+    // Simulate a completed prior round: user + assistant tool_call +
+    // big tool result + assistant reply, all committed to history.
+    let mut prev_asst = Message::assistant("ran ls".into());
+    prev_asst.tool_calls = Some(vec![oxigolem::agent::chat::ToolCall {
+        name: "bash".into(),
+        arguments: serde_json::json!({"command": "cat big.log"}),
+    }]);
+    engine.record_appended(vec![
+        Message::user("q1"),
+        prev_asst,
+        Message::tool("bash", &"BIG".repeat(5000)),
+        Message::assistant("here is the file".into()),
+    ]);
+
+    engine.send("q2".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(100));
+    while !engine.poll().is_empty() {}
+
+    let sent = &provider.seen.lock().unwrap()[0];
+    // [system, user(q1), assistant(tool_calls), tool(…), assistant, user(q2)]
+    let tool_msg = sent.iter().find(|m| m.role == "tool").expect("tool msg present");
+    assert!(
+        tool_msg.content.contains("output omitted"),
+        "old tool output should be stubbed in the request, got: {}",
+        &tool_msg.content[..tool_msg.content.len().min(80)]
+    );
+    assert_eq!(tool_msg.name.as_deref(), Some("bash"));
+    // Assistant tool_calls pairing survives.
+    let asst = sent.iter().find(|m| m.role == "assistant" && m.tool_calls.is_some());
+    assert!(asst.is_some(), "assistant tool_calls must survive pruning");
 }

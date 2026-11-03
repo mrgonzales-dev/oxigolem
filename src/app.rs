@@ -73,8 +73,7 @@ pub struct App {
     pub gen_done_tick: Option<u64>,
     /// Prompts submitted while a generation was in flight. They sit
     /// above the input as "waiting" and auto-send when the current
-    /// generation ends (Done) or is interrupted (Cancelled / Enter
-    /// with an empty input).
+    /// generation ends (Done) or is interrupted (Cancelled).
     pub pending_queue: Vec<String>,
 }
 
@@ -326,9 +325,9 @@ impl App {
     }
 
     /// Send input to the connected model. Called on Enter in Agent view.
-    /// While a generation is running: typed text queues (shown above
-    /// the input as waiting); Enter on an empty input cancels the
-    /// generation so the queued prompt can go next.
+    /// While a generation is running: typed text force-sends — it cancels
+    /// the in-flight reply and jumps the queue so this prompt goes next.
+    /// Esc is the only key that cancels without a new prompt.
     pub fn send_chat(&mut self) {
         if self.chat.is_none() {
             self.toast = Some("No provider connected — Ctrl+P to connect".to_string());
@@ -339,16 +338,18 @@ impl App {
 
         if self.chat.as_ref().unwrap().is_busy() {
             if text.is_empty() {
-                // Enter on empty input = interrupt; any queued prompt
-                // fires when the Cancelled event lands.
-                if let Some(c) = self.chat.as_mut() {
-                    c.cancel();
-                }
-                self.toast = Some("cancelling…".to_string());
+                // Enter on empty input does nothing while busy — Esc
+                // is the interrupt key.
                 return;
             }
+            // Force-send: cancel the running generation and jump this
+            // prompt to the front of the queue. It fires when the
+            // Cancelled event lands.
             self.parts.clear();
-            self.pending_queue.push(text);
+            self.pending_queue.insert(0, text);
+            if let Some(c) = self.chat.as_mut() {
+                c.cancel();
+            }
             return;
         }
 
@@ -419,13 +420,13 @@ impl App {
                     }
                 }
                 ChatEvent::Cancelled => {
-                    // Push a small "cancelled" marker so the transcript
+                    // Push a small "interrupted" marker so the transcript
                     // shows where the reply was cut off. Partial text
                     // stays visible; the user's question stays in history
                     // so they can ask again without losing context.
                     self.transcript.push(TranscriptEntry {
                         role: Role::Tool,
-                        text: "chat cancelled".to_string(),
+                        text: "interrupted".to_string(),
                         outcome: None,
                         expanded: false,
                     });
@@ -488,7 +489,6 @@ impl App {
             if let Some(c) = self.chat.as_mut() {
                 c.cancel();
             }
-            self.toast = Some("cancelling…".to_string());
             return false;
         }
         true

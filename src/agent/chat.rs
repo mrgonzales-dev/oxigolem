@@ -143,7 +143,7 @@ impl ChatEngine {
         let cancel = Arc::clone(&self.cancel);
         let mut msgs = Vec::with_capacity(self.history.len() + 1);
         msgs.push(Message::system(&system_prompt()));
-        msgs.extend(self.history.iter().cloned());
+        msgs.extend(prune_history(&self.history));
 
         thread::spawn(move || {
             let mut appended: Vec<Message> = Vec::new();
@@ -270,4 +270,29 @@ impl ChatEngine {
     pub fn history(&self) -> &[Message] {
         &self.history
     }
+}
+
+/// Copy of `history` for the request: tool results *before* the last
+/// user message have their `content` replaced with a stub so stale
+/// output doesn't pad every request. Role/name/tool_calls survive —
+/// the API needs the call↔result pairing intact. Local `history` is
+/// untouched (full data stays in `ToolOutcome`/`spilled` files).
+pub fn prune_history(history: &[Message]) -> Vec<Message> {
+    let last_user = history.iter().rposition(|m| m.role == "user");
+    history
+        .iter()
+        .enumerate()
+        .map(|(i, m)| {
+            if m.role == "tool" && last_user.is_some_and(|u| i < u) {
+                let mut stub = m.clone();
+                stub.content = format!(
+                    "[output omitted — {} chars]",
+                    m.content.len()
+                );
+                stub
+            } else {
+                m.clone()
+            }
+        })
+        .collect()
 }
