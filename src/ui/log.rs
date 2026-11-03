@@ -28,6 +28,11 @@ pub fn draw(
     // marker and the right edge.
     let body = "    ";
 
+    // Width available for body text once the marker and side margins are
+    // subtracted — used to pre-wrap thinking/golem so wrapped rows keep
+    // both margins instead of hugging column 0 / the right edge.
+    let body_w = (area.width as usize).saturating_sub(pad.len() + 2 + body.len() * 2);
+
     for (ei, entry) in transcript.iter().enumerate() {
         match entry.role {
             Role::User => {
@@ -50,46 +55,54 @@ pub fn draw(
                 lines.push(Line::default());
             }
             Role::Thinking => {
-                // "✻ reasoning…" — while the model is mid-generation the
-                // last thinking block gets a traveling orange→white shimmer;
-                // once done it settles to plain FAINT text.
+                // "✻ reasoning…" — pre-wrap to body_w so every visual row
+                // keeps the left margin; right margin comes free since
+                // pre-wrapped rows never reach the edge.
                 let live = thinking_live && ei + 1 == transcript.len();
                 let mut col = 0usize;
-                for (i, l) in entry.text.lines().enumerate() {
-                    let marker = if i == 0 { "✻ " } else { "  " };
-                    let mut spans = vec![Span::styled(
-                        pad.to_string() + marker + body,
-                        Style::default().fg(FAINT),
-                    )];
-                    for c in format!("{l}{body}").chars() {
-                        spans.push(Span::styled(
-                            c.to_string(),
-                            Style::default().fg(shade(live, col, tick)),
-                        ));
-                        col += 1;
+                let mut first = true;
+                for raw in entry.text.lines() {
+                    for l in wrap_chars(raw, body_w.max(1)) {
+                        let marker = if first { "✻ " } else { "  " };
+                        first = false;
+                        let mut spans = vec![Span::styled(
+                            pad.to_string() + marker + body,
+                            Style::default().fg(FAINT),
+                        )];
+                        for c in l.chars() {
+                            spans.push(Span::styled(
+                                c.to_string(),
+                                Style::default().fg(shade(live, col, tick)),
+                            ));
+                            col += 1;
+                        }
+                        lines.push(Line::from(spans));
                     }
-                    lines.push(Line::from(spans));
                 }
                 lines.push(Line::default());
             }
             Role::Golem => {
-                // "● markdown…" — assistant under the orange bullet.
+                // "● markdown…" — pre-wrap each rendered line's spans at
+                // body_w so both margins survive; paragraph wrap never sees
+                // a full-width row to mangle.
                 let md = tui_markdown::from_str(&entry.text);
-                for (i, line) in md.lines.into_iter().enumerate() {
-                    let mut prefixed = Line::default();
-                    let marker = if i == 0 { "● " } else { "  " };
-                    prefixed.spans.push(Span::styled(
-                        pad.to_string() + marker,
-                        Style::default()
-                            .fg(ORANGE)
-                            .add_modifier(Modifier::BOLD),
-                    ));
-                    prefixed.spans.push(Span::raw(body));
-                    prefixed.spans.extend(line.spans);
-                    prefixed.spans.push(Span::raw(body));
-                    lines.push(prefixed);
+                let mut first = true;
+                for line in md.lines.into_iter() {
+                    for sub in wrap_spans(line.spans, body_w.max(1)) {
+                        let marker = if first { "● " } else { "  " };
+                        first = false;
+                        let mut prefixed = Line::default();
+                        prefixed.spans.push(Span::styled(
+                            pad.to_string() + marker,
+                            Style::default()
+                                .fg(ORANGE)
+                                .add_modifier(Modifier::BOLD),
+                        ));
+                        prefixed.spans.push(Span::raw(body));
+                        prefixed.spans.extend(sub);
+                        lines.push(prefixed);
+                    }
                 }
-                lines.push(Line::default());
                 lines.push(Line::default());
             }
             Role::Tool => {
@@ -125,6 +138,43 @@ pub fn draw(
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
+}
+
+/// Wrap a plain-text line at `width` chars (hard cut — markdown sources
+/// already carry their own line breaks, word wrap is cosmetic here).
+fn wrap_chars(s: &str, width: usize) -> Vec<String> {
+    let chars: Vec<char> = s.chars().collect();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(width)
+        .map(|c| c.iter().collect())
+        .collect()
+}
+
+/// Wrap styled spans at `width` display cells, splitting spans at cut
+/// points while preserving each span's style.
+fn wrap_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Vec<Span<'_>>> {
+    let mut out: Vec<Vec<Span>> = vec![Vec::new()];
+    let mut col = 0usize;
+    for span in spans {
+        let mut text = span.content.to_string();
+        let style = span.style;
+        while !text.is_empty() {
+            let room = width.saturating_sub(col).max(1);
+            let take: usize = text.chars().take(room).count();
+            let head: String = text.chars().take(take).collect();
+            text = text.chars().skip(take).collect();
+            out.last_mut().unwrap().push(Span::styled(head, style));
+            col += take;
+            if col >= width && !text.is_empty() {
+                out.push(Vec::new());
+                col = 0;
+            }
+        }
+    }
+    out
 }
 
 /// Color for one character of live thinking text: a sine wave between
