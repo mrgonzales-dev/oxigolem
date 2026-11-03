@@ -1,16 +1,29 @@
 use oxigolem::app::{App, Role};
 use oxigolem::chat::{ChatEngine, ChatEvent, Message};
 use oxigolem::provider::ollama::Ollama;
-use oxigolem::provider::Provider;
+use oxigolem::provider::{Provider, StreamChunk};
 use std::cell::RefCell;
 use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-/// A mock provider that emits tokens from a predefined list.
+/// A mock provider that emits chunks from a predefined list.
 struct MockProvider {
-    tokens: Mutex<Vec<String>>,
+    chunks: Mutex<Vec<StreamChunk>>,
+}
+
+impl MockProvider {
+    fn content(texts: &[&str]) -> Self {
+        Self {
+            chunks: Mutex::new(
+                texts
+                    .iter()
+                    .map(|t| StreamChunk::Content(t.to_string()))
+                    .collect(),
+            ),
+        }
+    }
 }
 
 impl Provider for MockProvider {
@@ -26,11 +39,10 @@ impl Provider for MockProvider {
         &self,
         _model: &str,
         _messages: &[Message],
-        on_token: &dyn Fn(String),
+        on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
-        let tokens = self.tokens.lock().unwrap();
-        for t in tokens.iter() {
-            on_token(t.clone());
+        for c in self.chunks.lock().unwrap().iter() {
+            on_chunk(c.clone());
         }
         Ok(())
     }
@@ -38,9 +50,7 @@ impl Provider for MockProvider {
 
 #[test]
 fn chat_engine_streams_tokens_and_finishes() {
-    let provider = Arc::new(MockProvider {
-        tokens: Mutex::new(vec!["Hello".to_string(), " world".to_string()]),
-    });
+    let provider = Arc::new(MockProvider::content(&["Hello", " world"]));
     let mut engine = ChatEngine::new(provider, "mock-model".to_string());
 
     assert!(!engine.is_busy());
@@ -66,9 +76,7 @@ fn chat_engine_streams_tokens_and_finishes() {
 
 #[test]
 fn chat_engine_records_assistant_message() {
-    let provider = Arc::new(MockProvider {
-        tokens: Mutex::new(vec!["response".to_string()]),
-    });
+    let provider = Arc::new(MockProvider::content(&["response"]));
     let mut engine = ChatEngine::new(provider, "mock-model".to_string());
 
     engine.send("question".to_string()).unwrap();
@@ -88,9 +96,7 @@ fn chat_engine_records_assistant_message() {
 
 #[test]
 fn chat_engine_rejects_concurrent_send() {
-    let provider = Arc::new(MockProvider {
-        tokens: Mutex::new(vec!["slow".to_string()]),
-    });
+    let provider = Arc::new(MockProvider::content(&["slow"]));
     let mut engine = ChatEngine::new(provider, "mock-model".to_string());
 
     engine.send("first".to_string()).unwrap();
@@ -115,7 +121,7 @@ fn chat_engine_propagates_error() {
             &self,
             _model: &str,
             _messages: &[Message],
-            _on_token: &dyn Fn(String),
+            _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("provider failed".to_string())
         }
@@ -171,11 +177,17 @@ fn ollama_chat_streams_tokens() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|t| {
-            tokens.borrow_mut().push(t)
+        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+            tokens.borrow_mut().push(c)
         })
         .unwrap();
-    assert_eq!(*tokens.borrow(), vec!["Hello", " world"]);
+    assert_eq!(
+        *tokens.borrow(),
+        vec![
+            StreamChunk::Content("Hello".into()),
+            StreamChunk::Content(" world".into())
+        ]
+    );
 }
 
 #[test]
@@ -204,13 +216,19 @@ fn ollama_chat_no_total_stream_timeout() {
     let tokens = RefCell::new(Vec::new());
     let start = std::time::Instant::now();
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|t| {
-            tokens.borrow_mut().push(t)
+        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+            tokens.borrow_mut().push(c)
         })
         .unwrap();
     // The stream took >300ms total but still completed — no total timeout.
     assert!(start.elapsed() >= Duration::from_millis(300));
-    assert_eq!(*tokens.borrow(), vec!["a", "b"]);
+    assert_eq!(
+        *tokens.borrow(),
+        vec![
+            StreamChunk::Content("a".into()),
+            StreamChunk::Content("b".into())
+        ]
+    );
 }
 
 #[test]
@@ -257,10 +275,13 @@ fn ollama_chat_tolerates_abrupt_close_mid_stream() {
     let res = provider.chat(
         "m",
         &[Message { role: "user".into(), content: "hi".into() }],
-        &|t| tokens.borrow_mut().push(t),
+        &|c| tokens.borrow_mut().push(c),
     );
     assert!(res.is_ok(), "expected Ok, got {res:?}");
-    assert_eq!(*tokens.borrow(), vec!["partial answer"]);
+    assert_eq!(
+        *tokens.borrow(),
+        vec![StreamChunk::Content("partial answer".into())]
+    );
 }
 
 #[test]
@@ -282,11 +303,42 @@ fn ollama_chat_surfaces_thinking() {
     let provider = Ollama::new(host);
     let tokens = RefCell::new(Vec::new());
     provider
-        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|t| {
-            tokens.borrow_mut().push(t)
+        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|c| {
+            tokens.borrow_mut().push(c)
         })
         .unwrap();
-    assert_eq!(*tokens.borrow(), vec!["hmm", "answer"]);
+    assert_eq!(
+        *tokens.borrow(),
+        vec![
+            StreamChunk::Thinking("hmm".into()),
+            StreamChunk::Content("answer".into())
+        ]
+    );
+}
+
+#[test]
+fn app_thinking_and_reply_are_separate_entries() {
+    let provider = Arc::new(MockProvider {
+        chunks: Mutex::new(vec![
+            StreamChunk::Thinking("hmm".into()),
+            StreamChunk::Thinking(" hmm".into()),
+            StreamChunk::Content("answer".into()),
+        ]),
+    });
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(provider, "m".into()));
+    app.transcript.push(oxigolem::app::TranscriptEntry {
+        role: Role::User,
+        text: "hi".into(),
+    });
+    app.chat.as_mut().unwrap().send("hi".into()).unwrap();
+    std::thread::sleep(Duration::from_millis(150));
+    app.poll_chat();
+
+    let roles: Vec<Role> = app.transcript.iter().map(|e| e.role).collect();
+    assert_eq!(roles, vec![Role::User, Role::Thinking, Role::Golem]);
+    assert_eq!(app.transcript[1].text, "hmm hmm");
+    assert_eq!(app.transcript[2].text, "answer");
 }
 
 #[test]
@@ -303,7 +355,7 @@ fn app_chat_error_goes_to_transcript() {
             &self,
             _model: &str,
             _messages: &[Message],
-            _on_token: &dyn Fn(String),
+            _on_chunk: &dyn Fn(StreamChunk),
         ) -> Result<(), String> {
             Err("chat request failed: http://localhost:11434/api/chat: connection refused".into())
         }

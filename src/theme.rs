@@ -6,3 +6,4 @@ pub const ORANGE_DIM: Color = Color::Rgb(140, 60, 35);
 pub const FAINT: Color = Color::Rgb(90, 84, 78); // dim gray for borders/meta
 pub const BG: Color = Color::Rgb(10, 8, 7); // near-black warm
 pub const TEXT: Color = Color::Rgb(210, 200, 190); // warm off-white
+pub const USER_BG: Color = Color::Rgb(40, 36, 33); // gray highlight for user lines

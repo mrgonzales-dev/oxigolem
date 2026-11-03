@@ -8,7 +8,7 @@ use ratatui::{
 
 use crate::{
     app::{Role, TranscriptEntry},
-    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT},
+    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT, USER_BG},
 };
 
 /// Claude Code-style transcript: no box, no borders. The assistant speaks
@@ -21,12 +21,34 @@ pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
     for entry in transcript {
         match entry.role {
             Role::User => {
-                // "> text" — the user's own words, faint marker.
+                // "> text" — the user's own words on a gray highlight strip.
+                let bg = Style::default().bg(USER_BG);
+                let w = area.width as usize;
                 for (i, l) in entry.text.lines().enumerate() {
                     let marker = if i == 0 { "> " } else { "  " };
+                    let head = format!("{pad}{marker}");
+                    let used = head.chars().count() + l.chars().count();
+                    // Pad to a multiple of the view width so the highlight
+                    // fills every wrapped visual line end-to-end.
+                    let fill = if w == 0 { 0 } else { (w - used % w) % w };
+                    lines.push(Line::from(vec![
+                        Span::styled(head, bg.fg(FAINT)),
+                        Span::styled(l.to_string(), bg.fg(TEXT)),
+                        Span::styled(" ".repeat(fill), bg),
+                    ]));
+                }
+                lines.push(Line::default());
+            }
+            Role::Thinking => {
+                // "✻ reasoning…" — thinking in its own dimmed block.
+                for (i, l) in entry.text.lines().enumerate() {
+                    let marker = if i == 0 { "✻ " } else { "  " };
                     lines.push(Line::from(vec![
                         Span::styled(pad.to_string() + marker, Style::default().fg(FAINT)),
-                        Span::styled(l.to_string(), Style::default().fg(TEXT)),
+                        Span::styled(
+                            l.to_string(),
+                            Style::default().fg(FAINT).add_modifier(Modifier::DIM),
+                        ),
                     ]));
                 }
                 lines.push(Line::default());

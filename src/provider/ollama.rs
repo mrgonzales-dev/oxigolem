@@ -1,7 +1,7 @@
 use std::io::{BufRead, BufReader};
 use std::time::Duration;
 
-use super::Provider;
+use super::{Provider, StreamChunk};
 use crate::chat::Message;
 
 pub struct Ollama {
@@ -81,7 +81,7 @@ impl Provider for Ollama {
         &self,
         model: &str,
         messages: &[Message],
-        on_token: &dyn Fn(String),
+        on_chunk: &dyn Fn(StreamChunk),
     ) -> Result<(), String> {
         let url = format!("{}/api/chat", self.host.trim_end_matches('/'));
 
@@ -136,16 +136,20 @@ impl Provider for Ollama {
                     finished = true;
                     break;
                 }
-                // Thinking models put reasoning in `thinking`, answer in
-                // `content`. Surface whichever is present.
-                let piece = v["message"]["content"]
-                    .as_str()
-                    .filter(|s| !s.is_empty())
-                    .or_else(|| v["message"]["thinking"].as_str())
-                    .filter(|s| !s.is_empty());
-                if let Some(piece) = piece {
+                // Reasoning lives in `thinking`, the answer in `content`.
+                // Emit them as separate chunk types so the UI can render
+                // thinking in its own dimmed block above the reply.
+                if let Some(t) = v["message"]["thinking"].as_str()
+                    && !t.is_empty()
+                {
                     got_any = true;
-                    on_token(piece.to_string());
+                    on_chunk(StreamChunk::Thinking(t.to_string()));
+                }
+                if let Some(c) = v["message"]["content"].as_str()
+                    && !c.is_empty()
+                {
+                    got_any = true;
+                    on_chunk(StreamChunk::Content(c.to_string()));
                 }
             }
             if finished {

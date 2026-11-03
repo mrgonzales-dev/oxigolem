@@ -2,7 +2,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread;
 
-use crate::provider::Provider;
+use crate::provider::{Provider, StreamChunk};
 
 /// A single chat message in the Ollama API format.
 #[derive(Clone)]
@@ -13,7 +13,10 @@ pub struct Message {
 
 /// Events streamed from the background thread to the UI.
 pub enum ChatEvent {
+    /// Answer text for the current reply block.
     Token(String),
+    /// Reasoning text, rendered in its own dimmed block.
+    Thinking(String),
     Done,
     Error(String),
 }
@@ -59,8 +62,12 @@ impl ChatEngine {
 
         thread::spawn(move || {
             let tx_cb = tx.clone();
-            let result = provider.chat(&model, &messages, &|token: String| {
-                let _ = tx_cb.send(ChatEvent::Token(token));
+            let result = provider.chat(&model, &messages, &|chunk: StreamChunk| {
+                let ev = match chunk {
+                    StreamChunk::Content(t) => ChatEvent::Token(t),
+                    StreamChunk::Thinking(t) => ChatEvent::Thinking(t),
+                };
+                let _ = tx_cb.send(ev);
             });
             match result {
                 Ok(()) => { let _ = tx.send(ChatEvent::Done); }

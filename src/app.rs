@@ -15,9 +15,11 @@ pub enum View {
     Output,
 }
 
-#[derive(Clone)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Role {
     User,
+    /// Assistant reasoning — its own dimmed block, separate from the reply.
+    Thinking,
     Golem,
     Tool,
 }
@@ -264,10 +266,6 @@ impl App {
             role: Role::User,
             text: text.clone(),
         });
-        self.transcript.push(TranscriptEntry {
-            role: Role::Golem,
-            text: String::new(),
-        });
         if let Err(e) = self.chat.as_mut().unwrap().send(text) {
             self.toast = Some(e);
             self.transcript.pop();
@@ -280,25 +278,29 @@ impl App {
         let events = engine.poll();
         for ev in events {
             match ev {
+                ChatEvent::Thinking(t) => {
+                    Self::append_or_push(&mut self.transcript, Role::Thinking, t);
+                }
                 ChatEvent::Token(token) => {
-                    if let Some(last) = self.transcript.last_mut()
-                        && matches!(last.role, Role::Golem)
-                    {
-                        last.text.push_str(&token);
-                    }
+                    Self::append_or_push(&mut self.transcript, Role::Golem, token);
                 }
                 ChatEvent::Done => {
                     let text = self
                         .transcript
-                        .last()
+                        .iter()
+                        .rev()
+                        .take_while(|e| matches!(e.role, Role::Golem | Role::Thinking))
                         .filter(|e| matches!(e.role, Role::Golem))
                         .map(|e| e.text.clone())
-                        .unwrap_or_default();
+                        .collect::<Vec<_>>()
+                        .into_iter()
+                        .rev()
+                        .collect();
                     engine.record_assistant(text);
                 }
                 ChatEvent::Error(e) => {
-                    if let Some(last) = self.transcript.last_mut()
-                        && matches!(last.role, Role::Golem)
+                    while let Some(last) = self.transcript.last()
+                        && matches!(last.role, Role::Thinking | Role::Golem)
                         && last.text.is_empty()
                     {
                         self.transcript.pop();
@@ -311,6 +313,17 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Append text to the last entry if it has the same role, else push a new one.
+    fn append_or_push(transcript: &mut Vec<TranscriptEntry>, role: Role, text: String) {
+        if let Some(last) = transcript.last_mut()
+            && last.role == role
+        {
+            last.text.push_str(&text);
+            return;
+        }
+        transcript.push(TranscriptEntry { role, text });
     }
 
     /// Route Enter based on the current view.
