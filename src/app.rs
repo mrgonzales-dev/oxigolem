@@ -51,6 +51,10 @@ pub enum InputPart {
     Paste { id: usize, content: String },
 }
 
+/// Result of a background `list_models` fetch — provider index plus
+/// the live list or the error string.
+type ModelsFetch = (usize, Result<Vec<String>, String>);
+
 pub struct App {
     pub view: View,
     parts: Vec<InputPart>,
@@ -82,6 +86,9 @@ pub struct App {
     /// the footer reads this for `cached%` and `t/s`. `None` until
     /// the first done chunk arrives.
     pub last_usage: Option<Usage>,
+    /// Worker thread that fetches model lists off the UI thread.
+    models_rx: Option<std::sync::mpsc::Receiver<ModelsFetch>>,
+
 }
 
 impl App {
@@ -109,6 +116,7 @@ impl App {
             term_scroll: None,
             gen_done_tick: None,
             last_usage: None,
+            models_rx: None,
         }
     }
 
@@ -173,8 +181,14 @@ impl App {
     pub fn modal_items(&self) -> Vec<String> {
         let Some(m) = &self.modal else { return Vec::new() };
         let all: Vec<String> = match &m.kind {
-            Kind::Palette => vec!["Connect provider".to_string()],
+            Kind::Palette => vec![
+                "Connect provider".to_string(),
+                "/doctor — model + runtime report".to_string(),
+            ],
             Kind::Providers => self.providers.iter().map(|p| p.name().to_string()).collect(),
+            Kind::ModelsLoading { cached, .. } => {
+                cached.clone().unwrap_or_else(|| vec!["fetching…".to_string()])
+            }
             Kind::Models { models, .. } => models.clone(),
             Kind::Message(_) => Vec::new(),
         };
@@ -216,59 +230,166 @@ impl App {
             return;
         };
         self.modal = match m.kind {
+            Kind::Palette if choice.starts_with("/doctor") => {
+                let report = self.doctor_report();
+                self.transcript.push(TranscriptEntry {
+                    role: Role::Tool,
+                    text: report,
+                    outcome: None,
+                    expanded: true,
+                });
+                None
+            }
             Kind::Palette => Some(Modal::new(Kind::Providers)),
             Kind::Providers => {
                 let idx = self.providers.iter().position(|p| p.name() == choice);
-                idx.map(|i| match self.providers[i].list_models() {
-                    Ok(models) => Modal::new(Kind::Models { provider: i, models }),
-                    Err(e) => Modal::new(Kind::Message(e)),
+                idx.map(|i| {
+                    // Fetch the model list on a worker thread — a dead
+                    // ollama host must not block the UI for 3s. The
+                    // cached list (if any) shows immediately as a hint.
+                    let cached = provider::read_model_list(self.providers[i].name());
+                    let p = Arc::clone(&self.providers[i]);
+                    let (tx, rx) = std::sync::mpsc::channel();
+                    std::thread::spawn(move || {
+                        let _ = tx.send((i, p.list_models()));
+                    });
+                    self.models_rx = Some(rx);
+                    Modal::new(Kind::ModelsLoading { provider: i, cached })
                 })
             }
-            Kind::Models { provider, .. } => {
-                let p = Arc::clone(&self.providers[provider]);
-                self.connected = Some(Connection {
-                    provider: self.providers[provider].name(),
-                    model: choice.clone(),
-                });
-                let mut engine = ChatEngine::with_all(
-                    Arc::clone(&p),
-                    choice.clone(),
-                    self.shell.clone(),
-                    Arc::clone(&self.shells),
-                );
-                // Resolve num_ctx + think from the model card once —
-                // every request this session uses the same options so
-                // the prompt prefix (and its KV cache) stays stable.
-                if let Some(ollama) = p.as_any().downcast_ref::<crate::provider::ollama::Ollama>() {
-                    match ollama.inspect(&choice) {
-                        Ok(info) => {
-                            if !info.supports("tools") {
-                                self.toast = Some(
-                                    format!("{choice}: no tools capability — fenced mode")
-                                );
-                                engine.set_fenced(true);
-                            }
-                            let kv = crate::provider::ollama::kv_bytes_per_token(&info.raw);
-                            let num_ctx = crate::provider::ollama::resolve_num_ctx(
-                                info.context_length,
-                                crate::provider::ollama::avail_ram_bytes(),
-                                kv,
-                            );
-                            engine.set_options(crate::provider::ChatOptions {
-                                num_ctx,
-                                think: info.think_for(&choice),
-                            });
-                        }
-                        Err(e) => {
-                            self.toast = Some(format!("inspect failed: {e}"));
-                        }
-                    }
+            Kind::ModelsLoading { provider, .. } | Kind::Models { provider, .. } => {
+                // Enter on a "fetching…" placeholder is a no-op.
+                if choice == "fetching…" {
+                    self.modal = Some(m);
+                    return;
                 }
-                self.chat = Some(engine);
+                self.connect_model(provider, choice);
                 None
             }
             Kind::Message(_) => None,
         };
+    }
+
+    /// Connect `providers[i]` to `model` — shared by the live Models
+    /// picker and the ModelsLoading cache path. Resolves num_ctx +
+    /// think from the model card once; every request this session uses
+    /// the same options so the prompt prefix (and its KV cache) stays
+    /// stable.
+    fn connect_model(&mut self, i: usize, model: String) {
+        let p = Arc::clone(&self.providers[i]);
+        self.connected = Some(Connection {
+            provider: self.providers[i].name(),
+            model: model.clone(),
+        });
+        let mut engine = ChatEngine::with_all(
+            Arc::clone(&p),
+            model.clone(),
+            self.shell.clone(),
+            Arc::clone(&self.shells),
+        );
+        if let Some(ollama) = p.as_any().downcast_ref::<crate::provider::ollama::Ollama>() {
+            match ollama.inspect(&model) {
+                Ok(info) => {
+                    if !info.supports("tools") {
+                        self.toast =
+                            Some(format!("{model}: no tools capability — fenced mode"));
+                        engine.set_fenced(true);
+                    }
+                    let kv = crate::provider::ollama::kv_bytes_per_token(&info.raw);
+                    let num_ctx = crate::provider::ollama::resolve_num_ctx(
+                        info.context_length,
+                        crate::provider::ollama::avail_ram_bytes(),
+                        kv,
+                    );
+                    engine.set_options(crate::provider::ChatOptions {
+                        num_ctx,
+                        think: info.think_for(&model),
+                    });
+                }
+                Err(e) => {
+                    self.toast = Some(format!("inspect failed: {e}"));
+                }
+            }
+        }
+        self.chat = Some(engine);
+    }
+
+    /// Swap a ModelsLoading modal for the live list once the worker
+    /// thread lands; on failure fall back to the cached list or an
+    /// error message. Called every loop tick — cheap.
+    pub fn poll_models(&mut self) {
+        let Some(rx) = &self.models_rx else { return };
+        let Ok((i, res)) = rx.try_recv() else { return };
+        self.models_rx = None;
+        // Only swap if the user is still in the loading modal for
+        // this provider — otherwise the result is stale.
+        let still_loading = matches!(
+            self.modal.as_ref().map(|m| &m.kind),
+            Some(Kind::ModelsLoading { provider, .. }) if *provider == i
+        );
+        if !still_loading {
+            // Cache the live list anyway so a dead host next time
+            // shows something.
+            if let Ok(models) = &res {
+                provider::write_model_list(self.providers[i].name(), models);
+            }
+            return;
+        }
+        self.modal = Some(match res {
+            Ok(models) => {
+                provider::write_model_list(self.providers[i].name(), &models);
+                Modal::new(Kind::Models { provider: i, models })
+            }
+            Err(e) => {
+                let cached = provider::read_model_list(self.providers[i].name());
+                match cached {
+                    Some(models) if !models.is_empty() => {
+                        self.toast = Some(format!("offline — showing cached list ({e})"));
+                        Modal::new(Kind::Models { provider: i, models })
+                    }
+                    _ => Modal::new(Kind::Message(e)),
+                }
+            }
+        });
+    }
+
+    /// /doctor — model + runtime report as a transcript entry. Shows
+    /// the connected model's ctx, tool mode, and the last generation's
+    /// cache hit rate / prefill / t/s / load time.
+    fn doctor_report(&self) -> String {
+        let mut out = String::from("── /doctor ──\n");
+        match (&self.connected, &self.chat) {
+            (Some(c), Some(engine)) => {
+                out.push_str(&format!("provider : {}\n", c.provider));
+                out.push_str(&format!("model    : {}\n", engine.model()));
+                let o = engine.options();
+                out.push_str(&format!("num_ctx  : {}\n", o.num_ctx));
+                out.push_str(&format!("think    : {}\n", o.think));
+                out.push_str(&format!(
+                    "tools    : {}\n",
+                    if engine.is_fenced() { "fenced repair" } else { "native" }
+                ));
+            }
+            _ => {
+                out.push_str("no model connected — pick one via the palette\n");
+                return out;
+            }
+        }
+        match &self.last_usage {
+            Some(u) => {
+                out.push_str(&format!(
+                    "last turn: {}% cached ({}/{} prompt tokens)\n",
+                    u.cached_pct() as u32,
+                    u.cached,
+                    u.prompt
+                ));
+                out.push_str(&format!("prefill  : {} ms\n", u.prefill_ms));
+                out.push_str(&format!("t/s      : {:.1}\n", u.tokens_per_sec()));
+                out.push_str(&format!("load     : {} ms\n", u.load_ms));
+            }
+            None => out.push_str("no generation yet this session\n"),
+        }
+        out
     }
 
     /// Render the input for display: paste segments become `[Pasted text #N +K lines]` chips.

@@ -53,7 +53,7 @@ fn config_model(model: &str, key: &str) -> Option<bool> {
     v["models"][model][key].as_bool()
 }
 
-fn config_dir() -> Option<std::path::PathBuf> {
+pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
     if let Ok(d) = std::env::var("OXIGOLEM_CONFIG_DIR") {
         return Some(d.into());
     }

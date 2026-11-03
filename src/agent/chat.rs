@@ -163,6 +163,17 @@ impl ChatEngine {
         self.fenced = fenced;
     }
 
+    /// Read-only views for the /doctor report.
+    pub fn options(&self) -> &ChatOptions {
+        &self.opts
+    }
+    pub fn is_fenced(&self) -> bool {
+        self.fenced
+    }
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
     pub fn is_busy(&self) -> bool {
         self.rx.is_some()
     }

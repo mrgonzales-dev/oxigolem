@@ -107,3 +107,33 @@ pub trait Provider: Send + Sync + std::any::Any + 'static {
 pub fn registry() -> Vec<Arc<dyn Provider>> {
     vec![Arc::new(ollama::Ollama::default())]
 }
+
+/// Last model lists per provider, kept at `.oxigolem/model-list.json`.
+/// The connect flow reads it so a dead provider can still show the
+/// picker instantly; a successful live list overwrites the cache.
+fn model_list_path() -> Option<std::path::PathBuf> {
+    ollama::config_dir().map(|d| d.join("model-list.json"))
+}
+
+pub fn read_model_list(provider: &str) -> Option<Vec<String>> {
+    let text = std::fs::read_to_string(model_list_path()?).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    v[provider]
+        .as_array()
+        .map(|a| a.iter().filter_map(|m| m.as_str().map(str::to_string)).collect())
+}
+
+pub fn write_model_list(provider: &str, models: &[String]) {
+    let Some(path) = model_list_path() else { return };
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_else(|| serde_json::json!({}));
+    v[provider] = serde_json::json!(models);
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&path, s);
+    }
+}

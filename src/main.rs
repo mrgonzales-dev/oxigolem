@@ -43,6 +43,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
 
         app.poll_chat();
         app.poll_shells();
+        app.poll_models();
         app.normalize_view();
         app.tick = app.tick.wrapping_add(1);
 

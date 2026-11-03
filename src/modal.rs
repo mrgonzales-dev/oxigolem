@@ -2,6 +2,10 @@
 pub enum Kind {
     Palette,
     Providers,
+    /// Fetching the model list on a worker thread — keeps the UI
+    /// responsive when the provider is slow or down. `cached` carries
+    /// the last known list so the picker can offer it if the fetch fails.
+    ModelsLoading { provider: usize, cached: Option<Vec<String>> },
     Models { provider: usize, models: Vec<String> },
     Message(String),
 }
@@ -21,6 +25,7 @@ impl Modal {
         match self.kind {
             Kind::Palette => "commands",
             Kind::Providers => "connect provider",
+            Kind::ModelsLoading { .. } => "select model",
             Kind::Models { .. } => "select model",
             Kind::Message(_) => "notice",
         }
