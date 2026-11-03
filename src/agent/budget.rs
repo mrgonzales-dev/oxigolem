@@ -41,12 +41,36 @@ pub enum Plan {
 /// span would exceed `budget_tokens`, then walk the cut forward to the
 /// next `role: "user"` boundary so the kept tail never opens mid-turn.
 pub fn plan(history: &[Message], budget_tokens: usize, stored: Option<usize>) -> Plan {
+    plan_with_hint(history, budget_tokens, stored, 0)
+}
+
+/// `plan` with a server-side prompt count hint. The hint is Ollama's
+/// `prompt_eval_count` from the previous turn — when it exceeds the
+/// local estimate we trust the server, since it counts what actually
+/// filled the context window (system prompt, tool schemas, JSON
+/// escapes) and the local chars/4 figure drifts low on tool-heavy
+/// sessions. The hint lets compaction fire *before* the request that
+/// would have overflowed, instead of after the error.
+pub fn plan_with_hint(
+    history: &[Message],
+    budget_tokens: usize,
+    stored: Option<usize>,
+    last_prompt_tokens: usize,
+) -> Plan {
     if let Some(cut) = stored {
         return Plan::Compact {
             keep_from: cut.min(history.len()),
         };
     }
-    let total: usize = history.iter().map(estimate_tokens).sum();
+    let est: usize = history.iter().map(estimate_tokens).sum();
+    // The server's count includes the system prompt + tool schema
+    // overhead the local estimate can't see — a ~400-token fixed cost
+    // we subtract before comparing so history-only estimates stay on
+    // the same scale. The hint only tips the KeepAll/Compact decision;
+    // the cut itself still uses estimate_tokens per message.
+    const FIXED_OVERHEAD: usize = 400;
+    let server_history = last_prompt_tokens.saturating_sub(FIXED_OVERHEAD);
+    let total = est.max(server_history);
     if total <= budget_tokens {
         return Plan::KeepAll;
     }

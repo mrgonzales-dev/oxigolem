@@ -53,6 +53,51 @@ fn config_model(model: &str, key: &str) -> Option<bool> {
     v["models"][model][key].as_bool()
 }
 
+/// Write a per-model knob to `.oxigolem/config.json`, preserving any
+/// existing keys. `/think` persists its toggle here so the next launch
+/// restores the same reasoning state for this model.
+pub fn config_set_model(model: &str, key: &str, value: bool) {
+    config_patch(|v| v["models"][model][key] = serde_json::Value::Bool(value));
+}
+
+/// The globally saved default model — `config.json` `default` holds
+/// `{provider, model}`, written on every connect so the next launch
+/// reconnects without the palette round-trip.
+pub fn config_default_model() -> Option<(String, String)> {
+    let dir = config_dir()?;
+    let text = std::fs::read_to_string(dir.join("config.json")).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&text).ok()?;
+    let d = &v["default"];
+    Some((
+        d["provider"].as_str()?.to_string(),
+        d["model"].as_str()?.to_string(),
+    ))
+}
+
+pub fn config_set_default_model(provider: &str, model: &str) {
+    config_patch(|v| {
+        v["default"] = serde_json::json!({ "provider": provider, "model": model });
+    });
+}
+
+/// Load config.json, run `f` on it, write it back. Missing or corrupt
+/// files start from `{}` — the file only ever holds these knobs, so
+/// clobbering a broken blob loses nothing.
+fn config_patch(f: impl FnOnce(&mut serde_json::Value)) {
+    let Some(dir) = config_dir() else { return };
+    let path = dir.join("config.json");
+    let mut v: serde_json::Value = std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .filter(|v: &serde_json::Value| v.is_object())
+        .unwrap_or_else(|| serde_json::json!({}));
+    f(&mut v);
+    let _ = std::fs::create_dir_all(&dir);
+    if let Ok(s) = serde_json::to_string_pretty(&v) {
+        let _ = std::fs::write(&path, s);
+    }
+}
+
 pub(crate) fn config_dir() -> Option<std::path::PathBuf> {
     if let Ok(d) = std::env::var("OXIGOLEM_CONFIG_DIR") {
         return Some(d.into());

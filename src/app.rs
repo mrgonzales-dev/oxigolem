@@ -46,6 +46,10 @@ pub struct TranscriptEntry {
     /// Whether a long tool block is expanded. `false` collapses output
     /// past a small line budget into a `… (N lines hidden)` row.
     pub expanded: bool,
+    /// Tick when the outcome landed — the UI replays the output tail
+    /// with a fading green shimmer for ~30 ticks so even sub-frame
+    /// commands get a visible "streamed" beat instead of snapping.
+    pub done_tick: Option<u64>,
 }
 
 /// One segment of the input buffer: typed text or a paste chip.
@@ -92,11 +96,40 @@ pub struct App {
     pub last_usage: Option<Usage>,
     /// Worker thread that fetches model lists off the UI thread.
     models_rx: Option<std::sync::mpsc::Receiver<ModelsFetch>>,
+    /// Live inputs for the scope overlay. `tok_times` is a deque of
+    /// recent token-arrival instants → instantaneous t/s estimate.
+    /// `scope_phase` integrates phase_step() per tick so the ring
+    /// keeps rotating between frames. `sys_at`/`sys_prev_cpu` cache
+    /// the /proc reads — we re-sample at most every 500 ms.
+    tok_times: std::collections::VecDeque<std::time::Instant>,
+    /// Chars seen since the last whole ~token (4 chars) was counted.
+    tok_chars: usize,
+    pub scope_phase: f32,
+    scope_tps: f32,
+    sys_at: Option<std::time::Instant>,
+    sys_prev_cpu: Option<(u64, u64)>,
+    sys_mem: f32,
+    sys_cpu: f32,
 
 }
 
 impl App {
     pub fn new() -> Self {
+        // Setup memory: `config.json` `default` holds the last
+        // connected {provider, model} — reconnect it straight away so
+        // a repeat launch skips the palette entirely.
+        let mut app = Self::build();
+        if let Some((provider, model)) = crate::provider::ollama::config_default_model()
+            && let Some(i) = app.providers.iter().position(|p| p.name() == provider)
+        {
+            app.connect_model(i, model);
+        }
+        app
+    }
+
+    /// Field init for `new`, split out so `new` can mutate `app` after
+    /// construction (auto-reconnect of the saved default model).
+    fn build() -> Self {
         // Spill files live under the project the TUI was opened in —
         // `<launch-cwd>/.oxigolem/jobs`. Created eagerly; tools::execute
         // picks this up via `init_project_jobs_dir`.
@@ -121,6 +154,47 @@ impl App {
             gen_done_tick: None,
             last_usage: None,
             models_rx: None,
+            tok_times: std::collections::VecDeque::new(),
+            tok_chars: 0,
+            scope_phase: 0.0,
+            scope_tps: 0.0,
+            sys_at: None,
+            sys_prev_cpu: None,
+            sys_mem: 0.5,
+            sys_cpu: 0.0,
+        }
+    }
+
+    /// Snapshot of scope inputs for this frame. Re-samples /proc at
+    /// most every 500 ms; integrates the phase with the live t/s.
+    /// Call once per loop tick, before draw.
+    pub fn scope_input(&mut self) -> crate::ui::scope::ScopeInput {
+        // Prune token arrivals older than 2 s — that window is the
+        // instantaneous rate. Chars/4 ≈ tokens for a visual signal.
+        let now = std::time::Instant::now();
+        while let Some(t) = self.tok_times.front() {
+            if now.duration_since(*t) > std::time::Duration::from_millis(2000) {
+                self.tok_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        let target = self.tok_times.len() as f32 / 8.0; // chars→tok, /2s window
+        // EWMA toward the windowed rate — smooths the burstiness of
+        // NDJSON chunks so the ring doesn't jump.
+        self.scope_tps += (target - self.scope_tps) * 0.15;
+        self.scope_phase += crate::ui::scope::phase_step(self.scope_tps);
+        self.scope_phase %= std::f32::consts::TAU * 1000.0;
+
+        if self.sys_at.is_none_or(|t| now.duration_since(t).as_millis() >= 500) {
+            self.sys_mem = crate::ui::scope::mem_pressure();
+            self.sys_cpu = crate::ui::scope::cpu_busy(&mut self.sys_prev_cpu);
+            self.sys_at = Some(now);
+        }
+        crate::ui::scope::ScopeInput {
+            tps: self.scope_tps,
+            mem: self.sys_mem,
+            cpu: self.sys_cpu,
         }
     }
 
@@ -195,6 +269,7 @@ impl App {
                 "Connect provider".to_string(),
                 "/doctor — model + runtime report".to_string(),
                 "/think — toggle reasoning on the live engine".to_string(),
+                "/clear — wipe transcript + session memory".to_string(),
             ],
             Kind::Providers => self.providers.iter().map(|p| p.name().to_string()).collect(),
             Kind::ModelsLoading { cached, .. } => {
@@ -249,6 +324,10 @@ impl App {
                 self.toggle_think();
                 None
             }
+            Kind::Palette if choice.starts_with("/clear") => {
+                self.try_slash_command("/clear");
+                None
+            }
             Kind::Palette => Some(Modal::new(Kind::Providers)),
             Kind::Providers => {
                 let idx = self.providers.iter().position(|p| p.name() == choice);
@@ -290,12 +369,91 @@ impl App {
             provider: self.providers[i].name(),
             model: model.clone(),
         });
+        // Setup memory: remember this model so the next launch
+        // reconnects directly instead of going through the palette.
+        crate::provider::ollama::config_set_default_model(
+            self.providers[i].name(),
+            &model,
+        );
         let mut engine = ChatEngine::with_all(
             Arc::clone(&p),
             model.clone(),
             self.shell.clone(),
             Arc::clone(&self.shells),
         );
+        // Session memory: pull the last conversation out of
+        // `.oxigolem/session.json` so the new engine resumes where the
+        // last launch left off. Only fires when the file exists —
+        // `load_session` returns an empty vec otherwise.
+        let prior = crate::agent::chat::load_session();
+        if !prior.is_empty() {
+            self.toast = Some(format!("resumed session — {} messages", prior.len()));
+            // Paint the restored history so the transcript shows the
+            // conversation, not just the model's memory of it. Tool
+            // messages collapse to a dim one-liner — the full output
+            // is stale anyway.
+            for m in &prior {
+                match m.role.as_str() {
+                    "user" => self.transcript.push(TranscriptEntry {
+                        role: Role::User,
+                        text: m.content.clone(),
+                        outcome: None,
+                        expanded: false,
+                        done_tick: None,
+                    }),
+                    "assistant" => {
+                        if !m.content.is_empty() {
+                            self.transcript.push(TranscriptEntry {
+                                role: Role::Golem,
+                                text: m.content.clone(),
+                                outcome: None,
+                                expanded: false,
+                                done_tick: None,
+                            });
+                        }
+                        if let Some(calls) = &m.tool_calls {
+                            for c in calls {
+                                let cmd = c.arguments["command"]
+                                    .as_str()
+                                    .map(|s| format!("$ {s}"))
+                                    .unwrap_or_else(|| c.name.clone());
+                                self.transcript.push(TranscriptEntry {
+                                    role: Role::Report,
+                                    text: format!("⎿ {cmd}"),
+                                    outcome: None,
+                                    expanded: false,
+                                    done_tick: None,
+                                });
+                            }
+                        }
+                    }
+                    "tool" => {
+                        // Tool result — the matching `⎿ $ cmd` line was
+                        // already emitted by the assistant's tool_calls
+                        // pass; append the first output line to the last
+                        // entry instead of a second ⎿ row.
+                        let first = m.content.lines().next().unwrap_or("");
+                        let preview: String = first.chars().take(80).collect();
+                        if let Some(last) = self.transcript.last_mut()
+                            && last.role == Role::Report
+                            && last.text.starts_with("⎿")
+                        {
+                            last.text = format!("{} → {preview}", last.text);
+                            continue;
+                        }
+                        self.transcript.push(TranscriptEntry {
+                            role: Role::Report,
+                            text: format!("  ⎿ {} {preview}", m.name.as_deref().unwrap_or("tool")),
+                            outcome: None,
+                            expanded: false,
+                            done_tick: None,
+                        });
+                    }
+                    _ => {} // system + unknown roles stay engine-only
+                }
+            }
+            engine.restore_history(prior);
+        }
         if let Some(ollama) = p.as_any().downcast_ref::<crate::provider::ollama::Ollama>() {
             match ollama.inspect(&model) {
                 Ok(info) => {
@@ -377,6 +535,21 @@ impl App {
                 self.toggle_think();
                 true
             }
+            Some("/clear") => {
+                // Kill any in-flight generation first — otherwise its
+                // stream keeps landing in the fresh transcript and
+                // `record_appended` on Done re-saves the session we
+                // just deleted.
+                if let Some(engine) = self.chat.as_mut() {
+                    engine.force_abort();
+                    engine.clear_history();
+                }
+                self.transcript.clear();
+                self.scroll_back = None;
+                self.gen_done_tick = None;
+                self.toast = Some("cleared".to_string());
+                true
+            }
             _ => false,
         }
     }
@@ -394,6 +567,7 @@ impl App {
         match first {
             "/doctor" => first.chars().count(),
             "/think" => first.chars().count(),
+            "/clear" => first.chars().count(),
             _ => 0,
         }
     }
@@ -405,6 +579,7 @@ impl App {
             text: self.doctor_report(),
             outcome: None,
             expanded: true,
+            done_tick: None,
         });
     }
 
@@ -417,6 +592,9 @@ impl App {
         };
         let next = !engine.options().think;
         engine.set_think(next);
+        // Persist as the per-model override so the next launch's
+        // `think_for` restores the same state.
+        crate::provider::ollama::config_set_model(engine.model(), "think", next);
         self.toast = Some(format!("think → {}", if next { "on" } else { "off" }));
     }
 
@@ -600,6 +778,7 @@ impl App {
             text: text.clone(),
             outcome: None,
             expanded: false,
+            done_tick: None,
         });
         self.gen_done_tick = None;
         if let Err(e) = self.chat.as_mut().unwrap().send(text) {
@@ -668,6 +847,16 @@ impl App {
                     if self.transcript.last().is_some_and(|e| matches!(e.role, Role::Thinking)) {
                         self.gen_done_tick = Some(self.tick);
                     }
+                    // Scope: one arrival record per ~token (chunks are
+                    // small multi-char deltas; 1 record per 4 chars
+                    // keeps the rate honest).
+                    self.tok_chars += token.len();
+                    let n = self.tok_chars / 4;
+                    self.tok_chars %= 4;
+                    let now = std::time::Instant::now();
+                    for _ in 0..n.max(1) {
+                        self.tok_times.push_back(now);
+                    }
                     Self::append_or_push(&mut self.transcript, Role::Golem, token);
                 }
                 ChatEvent::ToolCall { name, args } => {
@@ -685,6 +874,7 @@ impl App {
                         text: command,
                         outcome: None,
                         expanded: false,
+                        done_tick: None,
                     });
                 }
                 ChatEvent::ToolResult { name, outcome } => {
@@ -702,12 +892,17 @@ impl App {
                                 e.text = outcome.command.clone();
                             }
                             e.outcome = Some(outcome);
+                            // Stamp the completion tick — the UI replays
+                            // the output tail with a fading green shimmer
+                            // so fast commands still read as "streamed".
+                            e.done_tick = Some(self.tick);
                         }
                         None => self.transcript.push(TranscriptEntry {
                             role: Role::Tool,
                             text: format!("[{name}]"),
                             outcome: Some(outcome),
                             expanded: false,
+                            done_tick: Some(self.tick),
                         }),
                     }
                 }
@@ -724,6 +919,7 @@ impl App {
                         text: "interrupted".to_string(),
                         outcome: None,
                         expanded: false,
+                        done_tick: None,
                     });
                     self.gen_done_tick = Some(self.tick);
                 }
@@ -748,6 +944,7 @@ impl App {
                         text: format!("chat error: {e}"),
                         outcome: None,
                         expanded: false,
+                        done_tick: None,
                     });
                     self.toast = Some("chat failed — see transcript".to_string());
                 }
@@ -768,6 +965,7 @@ impl App {
             text,
             outcome: None,
             expanded: false,
+            done_tick: None,
         });
     }
 

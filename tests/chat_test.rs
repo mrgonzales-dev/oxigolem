@@ -628,6 +628,7 @@ fn app_thinking_and_reply_are_separate_entries() {
         text: "hi".into(),
         outcome: None,
         expanded: false,
+        done_tick: None,
     });
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();
     std::thread::sleep(Duration::from_millis(150));
@@ -657,6 +658,7 @@ fn app_tool_events_render_as_tool_entries() {
         text: "run it".into(),
         outcome: None,
         expanded: false,
+        done_tick: None,
     });
     app.chat.as_mut().unwrap().send("run it".into()).unwrap();
     std::thread::sleep(Duration::from_millis(300));
@@ -710,12 +712,14 @@ fn name(&self) -> &'static str {
         text: "hi".into(),
         outcome: None,
         expanded: false,
+        done_tick: None,
     });
     app.transcript.push(oxigolem::app::TranscriptEntry {
         role: Role::Golem,
         text: String::new(),
         outcome: None,
         expanded: false,
+        done_tick: None,
     });
     // Manually kick a send so an error is pending.
     app.chat.as_mut().unwrap().send("hi".into()).unwrap();

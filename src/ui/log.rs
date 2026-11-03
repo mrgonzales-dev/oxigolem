@@ -8,11 +8,15 @@ use ratatui::{
 
 use crate::{
     app::{Role, TranscriptEntry},
-    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT, THINK_HOT, USER_BG},
+    shell::BgShells,
+    theme::{
+        FAINT, LIVE_BASE, LIVE_HOT, ORANGE, ORANGE_DIM, TEXT, THINK_BASE, THINK_HOT, USER_BG,
+    },
 };
 
 /// Claude Code-style transcript: no box, no borders. The assistant speaks
 /// under an orange `●`, the user under a faint `>`, tool output dimmed.
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     f: &mut Frame,
     area: Rect,
@@ -21,6 +25,8 @@ pub fn draw(
     tick: u64,
     scroll_back: Option<u16>,
     gen_done_tick: Option<u64>,
+    shells: &BgShells,
+    occlude: Option<Rect>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
     // Left gutter so markers sit one cell in from the edge.
@@ -84,6 +90,11 @@ pub fn draw(
                         None => 0.0,
                     }
                 };
+                // Total char count for scramble-edge math — the last
+                // ~24 chars of a live block flicker through random
+                // glyphs before settling on the real char, like the
+                // stream is decoding itself.
+                let total_chars: usize = entry.text.chars().count();
                 let mut col = 0usize;
                 let mut first = true;
                 for raw in entry.text.lines() {
@@ -95,8 +106,13 @@ pub fn draw(
                             Style::default().fg(FAINT),
                         )];
                         for c in l.chars() {
+                            let shown = if live {
+                                decode_char(c, col, total_chars, tick)
+                            } else {
+                                c
+                            };
                             spans.push(Span::styled(
-                                c.to_string(),
+                                shown.to_string(),
                                 Style::default().fg(shade(fade, col, tick)),
                             ));
                             col += 1;
@@ -151,6 +167,7 @@ pub fn draw(
                 // One wrapped line can still fill the screen (e.g. a
                 // 10KB classpath arg) — cap visible chars per line too.
                 const LINE_CAP: usize = 240;
+                let line_cap = LINE_CAP;
 
                 // In-flight placeholder (ToolCall arrived, ToolResult
                 // hasn't yet) renders the header alone. Chat errors and
@@ -179,6 +196,7 @@ pub fn draw(
                     Some(o) => ("bash".to_string(), o.command.clone()),
                     None => ("bash".to_string(), entry.text.clone()),
                 };
+                let in_flight = entry.outcome.is_none();
                 lines.push(Line::from(vec![
                     Span::styled(
                         format!("{pad}● "),
@@ -195,6 +213,81 @@ pub fn draw(
                         Style::default().fg(FAINT),
                     ),
                 ]));
+
+                // Live body — while the call is in flight, tail the
+                // matching bg shell's ring buffer and shimmer the
+                // newest lines green so the user watches output arrive
+                // like a real stream. The window is sized to the view:
+                // enough rows to fill the transcript while it runs.
+                if in_flight {
+                    let live_lines = (area.height as usize).saturating_sub(4).clamp(8, 64);
+                    let live: Vec<String> = {
+                        let reg = shells.lock().unwrap();
+                        reg.iter()
+                            .find(|s| {
+                                s.transient
+                                    .load(std::sync::atomic::Ordering::Relaxed)
+                                    && s.command == cmd
+                                    && matches!(s.status(), crate::shell::BgStatus::Running)
+                            })
+                            .map(|s| {
+                                // Tail directly off the ring buffers —
+                                // cloning the full 10k-line snapshot
+                                // every frame would hitch the UI on
+                                // chatty shells.
+                                let mut v: Vec<String> = s
+                                    .lines
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .rev()
+                                    .take(live_lines)
+                                    .cloned()
+                                    .collect();
+                                v.reverse();
+                                let errs: Vec<String> = s
+                                    .err_lines
+                                    .lock()
+                                    .unwrap()
+                                    .iter()
+                                    .rev()
+                                    .take(live_lines)
+                                    .map(|l| format!("! {l}"))
+                                    .collect();
+                                v.extend(errs.into_iter().rev());
+                                v
+                            })
+                            .unwrap_or_default()
+                    };
+                    let live: Vec<String> =
+                        live.iter().rev().take(live_lines).rev().cloned().collect();
+                    let tail: Vec<&String> = live.iter().rev().take(live_lines).collect();
+                    let tail: Vec<&&String> = tail.iter().rev().collect();
+                    let mut col = 0usize;
+                    for l in tail {
+                        let mut spans = vec![Span::styled(
+                            format!("{pad}  "),
+                            Style::default(),
+                        )];
+                        for c in l.chars().take(line_cap) {
+                            spans.push(Span::styled(
+                                c.to_string(),
+                                Style::default().fg(shade_live(col, tick)),
+                            ));
+                            col += 1;
+                        }
+                        lines.push(Line::from(spans));
+                    }
+                    if live.is_empty() {
+                        lines.push(Line::from(vec![
+                            Span::styled(format!("{pad}  "), Style::default()),
+                            Span::styled(
+                                "…".to_string(),
+                                Style::default().fg(shade_live(0, tick)),
+                            ),
+                        ]));
+                    }
+                }
 
                 // Body — only when we have an outcome; otherwise the call
                 // is still in flight and the header alone shows intent.
@@ -217,11 +310,32 @@ pub fn draw(
                         );
                     }
                     let total = body.len();
-                    let show = if entry.expanded || total <= COLLAPSE_LINES {
-                        &body[..]
+
+                    // Post-exit fade — a command that finishes inside one
+                    // frame never got an in-flight render, so for ~40
+                    // ticks after the outcome lands the output tail
+                    // replays with the live green shimmer easing back to
+                    // FAINT. Reads as "just streamed" instead of snapping.
+                    let fade = entry
+                        .done_tick
+                        .map(|t0| {
+                            let e = tick.saturating_sub(t0) as f32;
+                            (1.0 - e / 40.0).max(0.0)
+                        })
+                        .unwrap_or(0.0);
+                    let fading = fade > 0.0 && !entry.expanded;
+
+                    let (show, shown): (&[String], usize) = if fading {
+                        // Reveal the tail — the lines that "just arrived".
+                        let reveal = (area.height as usize / 2).clamp(6, 24);
+                        let n = total.min(reveal);
+                        (&body[total - n..], n)
+                    } else if entry.expanded || total <= COLLAPSE_LINES {
+                        (&body[..], total)
                     } else {
-                        &body[..COLLAPSE_LINES]
+                        (&body[..COLLAPSE_LINES], COLLAPSE_LINES)
                     };
+                    let mut col = 0usize;
                     for l in show {
                         let clipped = if l.chars().count() > LINE_CAP {
                             format!(
@@ -231,10 +345,25 @@ pub fn draw(
                         } else {
                             l.clone()
                         };
-                        lines.push(Line::from(vec![
-                            Span::styled(format!("{pad}  "), Style::default()),
-                            Span::styled(clipped, Style::default().fg(TEXT)),
-                        ]));
+                        if fading {
+                            let mut spans =
+                                vec![Span::styled(format!("{pad}  "), Style::default())];
+                            for c in clipped.chars() {
+                                spans.push(Span::styled(
+                                    c.to_string(),
+                                    Style::default().fg(shade_pair(
+                                        fade, col, tick, LIVE_BASE, LIVE_HOT,
+                                    )),
+                                ));
+                                col += 1;
+                            }
+                            lines.push(Line::from(spans));
+                        } else {
+                            lines.push(Line::from(vec![
+                                Span::styled(format!("{pad}  "), Style::default()),
+                                Span::styled(clipped, Style::default().fg(TEXT)),
+                            ]));
+                        }
                     }
                     if let Some(path) = &out.spilled {
                         lines.push(Line::from(vec![
@@ -245,8 +374,8 @@ pub fn draw(
                             ),
                         ]));
                     }
-                    if !entry.expanded && total > COLLAPSE_LINES {
-                        let hidden = total - COLLAPSE_LINES;
+                    if !entry.expanded && total > shown {
+                        let hidden = total - shown;
                         lines.push(Line::from(vec![
                             Span::styled(format!("{pad}  "), Style::default()),
                             Span::styled(
@@ -309,6 +438,51 @@ pub fn draw(
         Some(back) => bottom.saturating_sub(back as usize) as u16,
         None => bottom as u16,
     };
+
+    // Scope occlusion: the widget floats over the top-right `occ` rect
+    // of `area`. Any visual row landing under it must be clipped at
+    // the box's left edge so text wraps around instead of under. The
+    // transcript is bottom-anchored — visible top row is `scroll`, so
+    // occluded rows are `scroll .. scroll + occ.height`.
+    if let Some(occ) = occlude {
+        let clip_w = (occ.x as usize).saturating_sub(area.x as usize + 1);
+        let first = scroll as usize;
+        let last = first + occ.height as usize;
+        let mut row = 0usize; // absolute visual row, counting wraps
+        let mut out: Vec<Line> = Vec::with_capacity(lines.len());
+        for line in lines.into_iter() {
+            let rows_here = (line.width().max(1)).div_ceil(w).max(1);
+            let hits_occ = (row..row + rows_here).any(|r| r >= first && r < last);
+            if hits_occ {
+                // Re-wrap this line's spans at clip_w so nothing reaches
+                // the scope's left edge.
+                for sub in wrap_spans(line.spans, clip_w.max(1)) {
+                    out.push(Line::from(sub));
+                }
+            } else {
+                out.push(line);
+            }
+            row += rows_here;
+        }
+        lines = out;
+        // Re-wrap changed the row count — recount so scroll still pins
+        // the bottom row.
+        let total: usize = lines
+            .iter()
+            .map(|l| (l.width().max(1)).div_ceil(w))
+            .sum();
+        let bottom = total.saturating_sub(area.height as usize);
+        let scroll = match scroll_back {
+            Some(back) => bottom.saturating_sub(back as usize) as u16,
+            None => bottom as u16,
+        };
+        let p = Paragraph::new(lines)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0));
+        f.render_widget(p, area);
+        return;
+    }
+
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
@@ -352,27 +526,76 @@ fn wrap_spans(spans: Vec<Span<'_>>, width: usize) -> Vec<Vec<Span<'_>>> {
     out
 }
 
-/// Color for one character of thinking text. `fade` is 1.0 while the
-/// shimmer is fully on and 0.0 once it has eased back to FAINT; the sine
-/// wave keeps its position while its amplitude is scaled by `fade` and
-/// the whole color is lerped toward FAINT.
+/// Decode effect for the trailing edge of a live thinking block: the
+/// last ~24 chars of the stream cycle through random glyphs before
+/// locking to the real char. Deterministic on (col, tick) so each
+/// char flickers at its own pace; chars further from the edge settle
+/// sooner. Returns the char to draw this frame.
+fn decode_char(real: char, col: usize, total: usize, tick: u64) -> char {
+    // Distance from the end of the text. Once a char is more than
+    // ~24 positions behind the leading edge it's fully settled.
+    let dist_from_edge = total.saturating_sub(col + 1);
+    if dist_from_edge > 24 {
+        return real;
+    }
+    // Per-char hash picks a settle delay — earlier chars (larger
+    // dist) have mostly settled already; the very edge flickers.
+    let mut h = (col as u32).wrapping_mul(0x9e3779b9);
+    h ^= h << 13;
+    h ^= h >> 17;
+    h ^= h << 5;
+    // Each char settles after `settle_at` ticks since it appeared;
+    // approximate "age" as distance-from-edge * chars-per-tick.
+    // The stream adds roughly 1 char/tick, so age ≈ dist_from_edge.
+    let settle_at = 4 + (h % 16) as usize; // 4..20 ticks of flicker
+    if dist_from_edge > settle_at {
+        return real;
+    }
+    // Still scrambling — pick a glyph from a matrix-flavoured set,
+    // rehashing with tick so the char changes every frame.
+    const GLYPHS: &[char] = &[
+        'ｱ', 'ｲ', 'ｳ', 'ｴ', 'ｵ', 'ｶ', 'ｷ', 'ｸ', 'ｹ', 'ｺ', 'ｻ', 'ｼ', 'ｽ', 'ｾ', 'ｿ',
+        'ﾀ', 'ﾁ', 'ﾂ', 'ﾃ', 'ﾄ', 'ﾅ', 'ﾆ', 'ﾇ', 'ﾈ', 'ﾉ', 'ﾊ', 'ﾋ', 'ﾌ', 'ﾍ', 'ﾎ',
+        '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '+', '*', ':', '¦', '⟊',
+    ];
+    let mut h2 = h.wrapping_add(tick as u32);
+    h2 ^= h2 << 13;
+    h2 ^= h2 >> 17;
+    h2 ^= h2 << 5;
+    GLYPHS[(h2 as usize) % GLYPHS.len()]
+}
+
+/// Thinking palette — orange shimmer on the reasoning stream.
 fn shade(fade: f32, col: usize, tick: u64) -> Color {
+    shade_pair(fade, col, tick, THINK_BASE, THINK_HOT)
+}
+
+/// Live-tool palette — matrix green for the in-flight bash tail.
+fn shade_live(col: usize, tick: u64) -> Color {
+    shade_pair(1.0, col, tick, LIVE_BASE, LIVE_HOT)
+}
+
+/// Color for one character of shimmered text. `fade` is 1.0 while the
+/// shimmer is fully on and 0.0 once it has eased back to FAINT.
+/// Lava-lamp feel: a wide sine window (period ~96 cols) drifts slowly
+/// left→right (~1 col / 4 ticks at 50 ms/tick ≈ 4 s per column), and
+/// its amplitude is raised to a low power so the "blob" crest is wide
+/// and the troughs are broad — no sharp stripes.
+fn shade_pair(fade: f32, col: usize, tick: u64, base: Color, hot: Color) -> Color {
     if fade <= 0.0 {
         return FAINT;
     }
-    // Base of the wave is a light, near-white orange so the shimmer reads
-    // as a soft glow rather than a deep orange wash.
-    let (r1, g1, b1) = (255.0_f32, 170.0_f32, 120.0_f32);
-    let Color::Rgb(hr, hg, hb) = THINK_HOT else { return FAINT };
+    let Color::Rgb(br, bg_, bb) = base else { return FAINT };
+    let Color::Rgb(hr, hg, hb) = hot else { return FAINT };
     let Color::Rgb(fr, fg, fb) = FAINT else { return FAINT };
-    // Period ~24 columns; phase sweeps fast left→right with the frame count.
-    let phase = (col as f32 - tick as f32 * 3.2) * (std::f32::consts::TAU / 24.0);
-    let t = (phase.sin() + 1.0) / 2.0; // 0..1 along the wave
+    // Slow drift: full sweep of the ~96-col window in ~24 s.
+    let phase = (col as f32 - tick as f32 * 0.25) * (std::f32::consts::TAU / 96.0);
+    // powf(3) on the upper half of the sine widens the bright blob and
+    // flattens the trough — reads as a lava blob, not a stripe.
+    let t = ((phase.sin() + 1.0) / 2.0).powf(3.0);
     let mix = |a: f32, b: f32, k: f32| a + (b - a) * k;
-    // Wave color at this column, then blend the whole thing toward FAINT
-    // by `fade` so the block eases out instead of snapping.
-    let r = mix(mix(r1, hr as f32, t), fr as f32, 1.0 - fade);
-    let g = mix(mix(g1, hg as f32, t), fg as f32, 1.0 - fade);
-    let b = mix(mix(b1, hb as f32, t), fb as f32, 1.0 - fade);
+    let r = mix(mix(br as f32, hr as f32, t), fr as f32, 1.0 - fade);
+    let g = mix(mix(bg_ as f32, hg as f32, t), fg as f32, 1.0 - fade);
+    let b = mix(mix(bb as f32, hb as f32, t), fb as f32, 1.0 - fade);
     Color::Rgb(r as u8, g as u8, b as u8)
 }

@@ -39,7 +39,9 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     let mut app = App::new();
 
     loop {
-        terminal.draw(|f| draw(f, &app))?;
+        let scope = app.scope_input();
+        let busy = app.chat_busy();
+        terminal.draw(|f| draw(f, &app, busy.then_some(scope)))?;
 
         app.poll_chat();
         app.poll_shells();
@@ -126,7 +128,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> 
     }
 }
 
-fn draw(f: &mut ratatui::Frame, app: &App) {
+fn draw(f: &mut ratatui::Frame, app: &App, scope: Option<ui::scope::ScopeInput>) {
     let area = f.area();
 
     let root = Layout::default()
@@ -141,20 +143,44 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         ])
         .split(area);
 
+    // Inset the body by one row at the bottom so the transcript's last
+    // visible line never hugs the input's top border — reads as a
+    // gutter between stream and prompt.
+    let body = ratatui::layout::Rect {
+        height: root[0].height.saturating_sub(1),
+        ..root[0]
+    };
+    // The scope floats top-right of the frame while a generation
+    // streams — mirror its rect so the transcript wraps around it
+    // instead of rendering under the Clear.
+    let scope_rect = if scope.is_some() && app.modal.is_none() {
+        const W: u16 = 24;
+        const H: u16 = 11;
+        (area.width >= W + 2 && area.height >= H + 2).then(|| ratatui::layout::Rect {
+            x: area.x + area.width - W,
+            y: area.y,
+            width: W,
+            height: H,
+        })
+    } else {
+        None
+    };
     match app.view {
         View::Agent => ui::log::draw(
             f,
-            root[0],
+            body,
             &app.transcript,
             app.chat_busy(),
             app.tick,
             app.scroll_back,
             app.gen_done_tick,
+            &app.shells,
+            scope_rect,
         ),
         View::Shell(i) => {
             let reg = app.shells.lock().unwrap();
             if let Some(sh) = reg.get(i) {
-                ui::output::draw(f, root[0], sh, app.term_scroll);
+                ui::output::draw(f, body, sh, app.term_scroll);
             }
         }
     }
@@ -186,5 +212,12 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
 
     if let Some(t) = &app.toast {
         ui::toast::draw(f, area, t);
+    }
+
+    // Scope floats top-right, above the transcript but under modals.
+    if let Some(input) = scope
+        && app.modal.is_none()
+    {
+        ui::scope::draw(f, area, input, app.scope_phase);
     }
 }

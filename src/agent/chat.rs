@@ -32,8 +32,11 @@ pub struct Message {
 
 impl Message {
     fn bare(role: &str, content: String) -> Self {
+        Self::bare_owned(role.to_string(), content)
+    }
+    fn bare_owned(role: String, content: String) -> Self {
         Self {
-            role: role.to_string(),
+            role,
             content,
             tool_calls: None,
             name: None,
@@ -119,6 +122,16 @@ pub struct ChatEngine {
     /// commit to it. The cut never moves — a moving boundary would
     /// rewrite bytes in the middle of the request.
     compact_from: Option<usize>,
+    /// Prompt tokens the model actually evaluated on the last turn —
+    /// the server-reported count. Lets the budget fire compaction on
+    /// real context pressure instead of the chars/4 estimate, which
+    /// drifts badly on tool-heavy sessions (JSON escapes, tool
+    /// payloads, code blocks).
+    last_prompt_tokens: u64,
+    /// Shared slot the worker writes prompt_eval_count into; `send`
+    /// reads it before planning the next turn. Separate from
+    /// `last_prompt_tokens` because the write happens off-thread.
+    last_prompt_slot: Option<Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl ChatEngine {
@@ -147,6 +160,8 @@ impl ChatEngine {
             fenced: false,
             system_prompt: system_prompt(),
             compact_from: None,
+            last_prompt_tokens: 0,
+            last_prompt_slot: None,
         }
     }
 
@@ -208,12 +223,29 @@ impl ChatEngine {
         let cancel = Arc::clone(&self.cancel);
         let opts = self.opts.clone();
         let fenced = self.fenced;
+        // Pull the freshest server-reported prompt count into the
+        // cached field before planning — the worker writes it on
+        // every Usage chunk.
+        if let Some(slot) = &self.last_prompt_slot {
+            let n = slot.load(Ordering::Relaxed);
+            if n > self.last_prompt_tokens {
+                self.last_prompt_tokens = n;
+            }
+        }
         // Budget: pick the plan once per send. KeepAll sends history
         // verbatim; Compact sends history[cut..] where `cut` is the
         // committed boundary from a previous send (or a fresh one
         // committed now). Either way the request is append-only.
+        // When the server-reported prompt count is higher than the
+        // chars/4 estimate we trust the server — tool-heavy sessions
+        // underestimate badly.
         let budget_tokens = (self.opts.num_ctx as usize).saturating_mul(3) / 4;
-        let plan = super::budget::plan(&self.history, budget_tokens, self.compact_from);
+        let plan = super::budget::plan_with_hint(
+            &self.history,
+            budget_tokens,
+            self.compact_from,
+            self.last_prompt_tokens as usize,
+        );
         if let super::budget::Plan::Compact { keep_from } = plan {
             self.compact_from = Some(keep_from);
         }
@@ -227,6 +259,9 @@ impl ChatEngine {
         msgs.push(Message::system(&self.system_prompt));
         msgs.extend(history_slice.iter().cloned());
 
+        let last_prompt_slot = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let last_prompt_slot_worker = Arc::clone(&last_prompt_slot);
+        self.last_prompt_slot = Some(last_prompt_slot);
         thread::spawn(move || {
             let mut appended: Vec<Message> = Vec::new();
             let result = (|| -> Result<(), String> {
@@ -273,6 +308,8 @@ impl ChatEngine {
                                     calls.push(ToolCall { name, arguments });
                                 }
                                 StreamChunk::Usage(u) => {
+                                    last_prompt_slot_worker
+                                        .store(u.prompt, Ordering::Relaxed);
                                     let _ = tx.send(ChatEvent::Usage(u));
                                 }
                             },
@@ -464,11 +501,112 @@ impl ChatEngine {
 
     /// Extend history with the messages produced during a generation
     /// (assistant replies and tool results). Called on `Done`.
+    /// Persists to `.oxigolem/session.json` so the next launch picks
+    /// the conversation back up — one file per project dir.
     pub fn record_appended(&mut self, msgs: Vec<Message>) {
         self.history.extend(msgs);
+        save_session(&self.history);
     }
 
     pub fn history(&self) -> &[Message] {
         &self.history
+    }
+
+    /// Replace history wholesale — used by App::new to restore the
+    /// previous session from disk. `compact_from` resets since the
+    /// restored boundary may not match the loaded slice.
+    pub fn restore_history(&mut self, msgs: Vec<Message>) {
+        self.history = msgs;
+        self.compact_from = None;
+    }
+
+    /// `/clear` — drop all history and delete the session file so the
+    /// next launch starts fresh.
+    pub fn clear_history(&mut self) {
+        self.history.clear();
+        self.compact_from = None;
+        if let Some(path) = session_path() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Session file: `.oxigolem/session.json` under the launch cwd — one
+/// file per project, overwritten on every turn. History is a flat
+/// JSON array of messages; tool_calls/name fields ride along.
+fn session_path() -> Option<std::path::PathBuf> {
+    std::env::current_dir()
+        .ok()
+        .map(|d| d.join(".oxigolem").join("session.json"))
+}
+
+/// Load the previous session's history, if any. Corrupt or missing
+/// files just start a fresh session.
+pub fn load_session() -> Vec<Message> {
+    let Some(path) = session_path() else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(&path) else { return Vec::new() };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) else {
+        return Vec::new();
+    };
+    let Some(arr) = v.as_array() else { return Vec::new() };
+    arr.iter()
+        .filter_map(|m| {
+            let role = m["role"].as_str()?.to_string();
+            let content = m["content"].as_str().unwrap_or("").to_string();
+            let mut msg = Message::bare_owned(role, content);
+            if let Some(calls) = m["tool_calls"].as_array() {
+                msg.tool_calls = Some(
+                    calls
+                        .iter()
+                        .filter_map(|c| {
+                            let f = &c["function"];
+                            Some(ToolCall {
+                                name: f["name"].as_str()?.to_string(),
+                                arguments: f["arguments"].clone(),
+                            })
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(n) = m["name"].as_str() {
+                msg.name = Some(n.to_string());
+            }
+            Some(msg)
+        })
+        .collect()
+}
+
+/// Overwrite the session file with the current history. Cheap for
+/// typical session sizes; runs on Done, not per-token.
+fn save_session(history: &[Message]) {
+    let Some(path) = session_path() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let arr: Vec<serde_json::Value> = history
+        .iter()
+        .map(|m| {
+            let mut v = serde_json::json!({"role": m.role, "content": m.content});
+            if let Some(calls) = &m.tool_calls {
+                v["tool_calls"] = serde_json::Value::Array(
+                    calls
+                        .iter()
+                        .map(|c| {
+                            serde_json::json!({"function": {
+                                "name": c.name,
+                                "arguments": c.arguments,
+                            }})
+                        })
+                        .collect(),
+                );
+            }
+            if let Some(n) = &m.name {
+                v["name"] = serde_json::Value::String(n.clone());
+            }
+            v
+        })
+        .collect();
+    if let Ok(s) = serde_json::to_string(&arr) {
+        let _ = std::fs::write(&path, s);
     }
 }
