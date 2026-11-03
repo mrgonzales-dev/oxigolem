@@ -2,7 +2,7 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Paragraph, Wrap},
+    widgets::{Paragraph, Wrap},
     Frame,
 };
 
@@ -11,51 +11,59 @@ use crate::{
     theme::{FAINT, ORANGE, ORANGE_DIM, TEXT},
 };
 
-fn role_label(role: &Role) -> (&'static str, ratatui::style::Color) {
-    match role {
-        Role::User => ("user", FAINT),
-        Role::Golem => ("golem", ORANGE),
-        Role::Tool => ("tool", ORANGE_DIM),
-    }
-}
-
+/// Claude Code-style transcript: no box, no borders. The assistant speaks
+/// under an orange `●`, the user under a faint `>`, tool output dimmed.
 pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
     let mut lines: Vec<Line> = Vec::new();
+    // Left gutter so markers sit one cell in from the edge.
+    let pad = "  ";
 
     for entry in transcript {
-        let (label, color) = role_label(&entry.role);
         match entry.role {
+            Role::User => {
+                // "> text" — the user's own words, faint marker.
+                for (i, l) in entry.text.lines().enumerate() {
+                    let marker = if i == 0 { "> " } else { "  " };
+                    lines.push(Line::from(vec![
+                        Span::styled(pad.to_string() + marker, Style::default().fg(FAINT)),
+                        Span::styled(l.to_string(), Style::default().fg(TEXT)),
+                    ]));
+                }
+                lines.push(Line::default());
+            }
             Role::Golem => {
+                // "● markdown…" — assistant under the orange bullet.
                 let md = tui_markdown::from_str(&entry.text);
-                for line in md.lines {
+                for (i, line) in md.lines.into_iter().enumerate() {
                     let mut prefixed = Line::default();
+                    let marker = if i == 0 { "● " } else { "  " };
                     prefixed.spans.push(Span::styled(
-                        format!("{label:>6} "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                        pad.to_string() + marker,
+                        Style::default()
+                            .fg(ORANGE)
+                            .add_modifier(Modifier::BOLD),
                     ));
                     prefixed.spans.extend(line.spans);
                     lines.push(prefixed);
                 }
                 lines.push(Line::default());
             }
-            _ => {
-                lines.push(Line::from(vec![
-                    Span::styled(
-                        format!("{label:>6} "),
-                        Style::default().fg(color).add_modifier(Modifier::BOLD),
-                    ),
-                    Span::styled(entry.text.clone(), Style::default().fg(TEXT)),
-                ]));
+            Role::Tool => {
+                // "  ⎿ text" — tool output indented, dimmed, like Claude Code.
+                for l in entry.text.lines() {
+                    lines.push(Line::from(vec![
+                        Span::styled(
+                            format!("{pad}  ⎿ "),
+                            Style::default().fg(ORANGE_DIM),
+                        ),
+                        Span::styled(l.to_string(), Style::default().fg(FAINT)),
+                    ]));
+                }
+                lines.push(Line::default());
             }
         }
     }
 
-    let block = Block::default()
-        .title(" oxigolem ")
-        .title_style(Style::default().fg(ORANGE))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(FAINT));
-
-    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false });
     f.render_widget(p, area);
 }
