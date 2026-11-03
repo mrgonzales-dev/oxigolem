@@ -366,6 +366,22 @@ impl App {
         }
     }
 
+    /// Length in chars of the recognized slash-command prefix at the
+    /// start of `text`, or 0 when the input doesn't begin with a known
+    /// command. Used by the input bar to paint `/doctor` orange while
+    /// the user types. The `/` must sit at column 0 — `input_display`
+    /// isn't trimmed, so a leading space would offset the highlight.
+    pub fn slash_cmd_prefix_len(text: &str) -> usize {
+        if !text.starts_with('/') {
+            return 0;
+        }
+        let first = text.split_whitespace().next().unwrap_or("");
+        match first {
+            "/doctor" => first.chars().count(),
+            _ => 0,
+        }
+    }
+
     /// Push the /doctor report as a transcript entry.
     fn push_doctor_report(&mut self) {
         self.transcript.push(TranscriptEntry {

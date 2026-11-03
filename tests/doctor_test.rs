@@ -121,6 +121,19 @@ fn slash_like_non_command_text_reaches_model() {
 }
 
 #[test]
+fn slash_cmd_prefix_len_marks_only_recognized_commands() {
+    assert_eq!(App::slash_cmd_prefix_len("/doctor"), 7);
+    assert_eq!(App::slash_cmd_prefix_len("/doctor extra args"), 7);
+    // Unknown commands / partials / non-slash input don't highlight.
+    assert_eq!(App::slash_cmd_prefix_len("/doc"), 0);
+    assert_eq!(App::slash_cmd_prefix_len("/doctorwho"), 0);
+    assert_eq!(App::slash_cmd_prefix_len("/etc/passwd"), 0);
+    assert_eq!(App::slash_cmd_prefix_len("doctor"), 0);
+    assert_eq!(App::slash_cmd_prefix_len(""), 0);
+    assert_eq!(App::slash_cmd_prefix_len(" /doctor"), 0); // leading space breaks it
+}
+
+#[test]
 fn doctor_reports_model_ctx_tools_and_usage() {
     let mut app = App::new();
     app.chat = Some(ChatEngine::new(Arc::new(Dummy), "qwen3:1.7b".into()));
