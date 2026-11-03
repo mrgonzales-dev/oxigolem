@@ -106,20 +106,11 @@ pub struct App {
     pub last_usage: Option<Usage>,
     /// Worker thread that fetches model lists off the UI thread.
     models_rx: Option<std::sync::mpsc::Receiver<ModelsFetch>>,
-    /// Live inputs for the scope overlay. `tok_times` is a deque of
-    /// recent token-arrival instants → instantaneous t/s estimate.
-    /// `scope_phase` integrates phase_step() per tick so the ring
-    /// keeps rotating between frames. `sys_at`/`sys_prev_cpu` cache
-    /// the /proc reads — we re-sample at most every 500 ms.
+    /// Recent token-arrival instants — kept for the instantaneous
+    /// t/s estimate shown in the footer (chars/4 ≈ tokens).
     tok_times: std::collections::VecDeque<std::time::Instant>,
     /// Chars seen since the last whole ~token (4 chars) was counted.
     tok_chars: usize,
-    pub scope_phase: f32,
-    scope_tps: f32,
-    sys_at: Option<std::time::Instant>,
-    sys_prev_cpu: Option<(u64, u64)>,
-    sys_mem: f32,
-    sys_cpu: f32,
 
 }
 
@@ -168,45 +159,6 @@ impl App {
             models_rx: None,
             tok_times: std::collections::VecDeque::new(),
             tok_chars: 0,
-            scope_phase: 0.0,
-            scope_tps: 0.0,
-            sys_at: None,
-            sys_prev_cpu: None,
-            sys_mem: 0.5,
-            sys_cpu: 0.0,
-        }
-    }
-
-    /// Snapshot of scope inputs for this frame. Re-samples /proc at
-    /// most every 500 ms; integrates the phase with the live t/s.
-    /// Call once per loop tick, before draw.
-    pub fn scope_input(&mut self) -> crate::ui::scope::ScopeInput {
-        // Prune token arrivals older than 2 s — that window is the
-        // instantaneous rate. Chars/4 ≈ tokens for a visual signal.
-        let now = std::time::Instant::now();
-        while let Some(t) = self.tok_times.front() {
-            if now.duration_since(*t) > std::time::Duration::from_millis(2000) {
-                self.tok_times.pop_front();
-            } else {
-                break;
-            }
-        }
-        let target = self.tok_times.len() as f32 / 8.0; // chars→tok, /2s window
-        // EWMA toward the windowed rate — smooths the burstiness of
-        // NDJSON chunks so the ring doesn't jump.
-        self.scope_tps += (target - self.scope_tps) * 0.15;
-        self.scope_phase += crate::ui::scope::phase_step(self.scope_tps);
-        self.scope_phase %= std::f32::consts::TAU * 1000.0;
-
-        if self.sys_at.is_none_or(|t| now.duration_since(t).as_millis() >= 500) {
-            self.sys_mem = crate::ui::scope::mem_pressure();
-            self.sys_cpu = crate::ui::scope::cpu_busy(&mut self.sys_prev_cpu);
-            self.sys_at = Some(now);
-        }
-        crate::ui::scope::ScopeInput {
-            tps: self.scope_tps,
-            mem: self.sys_mem,
-            cpu: self.sys_cpu,
         }
     }
 

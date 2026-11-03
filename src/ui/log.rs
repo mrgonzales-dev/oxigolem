@@ -26,7 +26,6 @@ pub fn draw(
     scroll_back: Option<u16>,
     gen_done_tick: Option<u64>,
     shells: &BgShells,
-    occlude: Option<Rect>,
     report_bottom: &std::cell::Cell<u16>,
 ) {
     let mut lines: Vec<Line> = Vec::new();
@@ -430,10 +429,35 @@ pub fn draw(
     // the render width. `scroll_back` pins a manual offset from the bottom;
     // None follows the newest entry.
     let w = area.width.max(1) as usize;
-    let total: usize = lines
+    let mut total: usize = lines
         .iter()
         .map(|l| (l.width().max(1)).div_ceil(w))
         .sum();
+
+    // Paragraph::scroll takes a u16 — a transcript past 65,535 rows
+    // truncates the offset and the view locks near the top with the
+    // tail unreachable. Cap the render to the newest ~60k rows by
+    // dropping leading lines; nobody scrolls 60k rows back anyway.
+    const MAX_ROWS: usize = 60_000;
+    if total > MAX_ROWS {
+        let mut dropped = Vec::with_capacity(lines.len());
+        let mut keep_from = 0usize;
+        let mut rows_seen = 0usize;
+        for (i, l) in lines.iter().enumerate() {
+            rows_seen += (l.width().max(1)).div_ceil(w);
+            if total - rows_seen <= MAX_ROWS {
+                keep_from = i;
+                break;
+            }
+        }
+        dropped.extend(lines.drain(keep_from..));
+        lines = dropped;
+        total = lines
+            .iter()
+            .map(|l| (l.width().max(1)).div_ceil(w))
+            .sum();
+    }
+
     let bottom = total.saturating_sub(area.height as usize);
     report_bottom.set(bottom.min(u16::MAX as usize) as u16);
     let scroll = match scroll_back {
@@ -442,51 +466,6 @@ pub fn draw(
         Some(back) => bottom.saturating_sub((back as usize).min(bottom)) as u16,
         None => bottom as u16,
     };
-
-    // Scope occlusion: the widget floats over the top-right `occ` rect
-    // of `area`. Any visual row landing under it must be clipped at
-    // the box's left edge so text wraps around instead of under. The
-    // transcript is bottom-anchored — visible top row is `scroll`, so
-    // occluded rows are `scroll .. scroll + occ.height`.
-    if let Some(occ) = occlude {
-        let clip_w = (occ.x as usize).saturating_sub(area.x as usize + 1);
-        let first = scroll as usize;
-        let last = first + occ.height as usize;
-        let mut row = 0usize; // absolute visual row, counting wraps
-        let mut out: Vec<Line> = Vec::with_capacity(lines.len());
-        for line in lines.into_iter() {
-            let rows_here = (line.width().max(1)).div_ceil(w).max(1);
-            let hits_occ = (row..row + rows_here).any(|r| r >= first && r < last);
-            if hits_occ {
-                // Re-wrap this line's spans at clip_w so nothing reaches
-                // the scope's left edge.
-                for sub in wrap_spans(line.spans, clip_w.max(1)) {
-                    out.push(Line::from(sub));
-                }
-            } else {
-                out.push(line);
-            }
-            row += rows_here;
-        }
-        lines = out;
-        // Re-wrap changed the row count — recount so scroll still pins
-        // the bottom row.
-        let total: usize = lines
-            .iter()
-            .map(|l| (l.width().max(1)).div_ceil(w))
-            .sum();
-        let bottom = total.saturating_sub(area.height as usize);
-        report_bottom.set(bottom.min(u16::MAX as usize) as u16);
-        let scroll = match scroll_back {
-            Some(back) => bottom.saturating_sub((back as usize).min(bottom)) as u16,
-            None => bottom as u16,
-        };
-        let p = Paragraph::new(lines)
-            .wrap(Wrap { trim: false })
-            .scroll((scroll, 0));
-        f.render_widget(p, area);
-        return;
-    }
 
     let p = Paragraph::new(lines)
         .wrap(Wrap { trim: false })
