@@ -194,6 +194,7 @@ impl App {
             Kind::Palette => vec![
                 "Connect provider".to_string(),
                 "/doctor — model + runtime report".to_string(),
+                "/think — toggle reasoning on the live engine".to_string(),
             ],
             Kind::Providers => self.providers.iter().map(|p| p.name().to_string()).collect(),
             Kind::ModelsLoading { cached, .. } => {
@@ -242,6 +243,10 @@ impl App {
         self.modal = match m.kind {
             Kind::Palette if choice.starts_with("/doctor") => {
                 self.push_doctor_report();
+                None
+            }
+            Kind::Palette if choice.starts_with("/think") => {
+                self.toggle_think();
                 None
             }
             Kind::Palette => Some(Modal::new(Kind::Providers)),
@@ -368,6 +373,10 @@ impl App {
                 self.push_doctor_report();
                 true
             }
+            Some("/think") => {
+                self.toggle_think();
+                true
+            }
             _ => false,
         }
     }
@@ -384,6 +393,7 @@ impl App {
         let first = text.split_whitespace().next().unwrap_or("");
         match first {
             "/doctor" => first.chars().count(),
+            "/think" => first.chars().count(),
             _ => 0,
         }
     }
@@ -396,6 +406,18 @@ impl App {
             outcome: None,
             expanded: true,
         });
+    }
+
+    /// `/think` — flip `ChatOptions.think` on the live engine and
+    /// confirm with a toast. No-op when no model is connected.
+    fn toggle_think(&mut self) {
+        let Some(engine) = self.chat.as_mut() else {
+            self.toast = Some("no model connected".to_string());
+            return;
+        };
+        let next = !engine.options().think;
+        engine.set_think(next);
+        self.toast = Some(format!("think → {}", if next { "on" } else { "off" }));
     }
 
     /// /doctor — model + runtime report as a transcript entry. Shows

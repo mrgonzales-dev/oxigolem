@@ -156,6 +156,13 @@ impl ChatEngine {
         self.opts = opts;
     }
 
+    /// Toggle reasoning on/off mid-session. `/think` flips this — the
+    /// change applies to the next generation (the in-flight one, if
+    /// any, keeps its already-sent options).
+    pub fn set_think(&mut self, on: bool) {
+        self.opts.think = on;
+    }
+
     /// Mark the model as lacking native tool support — Phase 4 uses
     /// this to turn on fenced-block repair instead of tools[] calls.
     /// Stored now so the capability toast can land before Phase 4 ships.

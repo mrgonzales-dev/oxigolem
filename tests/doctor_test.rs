@@ -124,6 +124,8 @@ fn slash_like_non_command_text_reaches_model() {
 fn slash_cmd_prefix_len_marks_only_recognized_commands() {
     assert_eq!(App::slash_cmd_prefix_len("/doctor"), 7);
     assert_eq!(App::slash_cmd_prefix_len("/doctor extra args"), 7);
+    assert_eq!(App::slash_cmd_prefix_len("/think"), 6);
+    assert_eq!(App::slash_cmd_prefix_len("/think on"), 6);
     // Unknown commands / partials / non-slash input don't highlight.
     assert_eq!(App::slash_cmd_prefix_len("/doc"), 0);
     assert_eq!(App::slash_cmd_prefix_len("/doctorwho"), 0);
@@ -131,6 +133,41 @@ fn slash_cmd_prefix_len_marks_only_recognized_commands() {
     assert_eq!(App::slash_cmd_prefix_len("doctor"), 0);
     assert_eq!(App::slash_cmd_prefix_len(""), 0);
     assert_eq!(App::slash_cmd_prefix_len(" /doctor"), 0); // leading space breaks it
+}
+
+#[test]
+fn think_toggles_engine_and_shows_toast() {
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(Dummy), "m".into()));
+    // ChatOptions::default().think = true; the toggle flips it OFF first.
+    assert!(app.chat.as_ref().unwrap().options().think);
+
+    for c in "/think".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    assert!(!app.chat.as_ref().unwrap().options().think);
+    assert_eq!(app.toast.as_deref(), Some("think → off"));
+
+    // Second invocation flips back on.
+    for c in "/think".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    assert!(app.chat.as_ref().unwrap().options().think);
+    assert_eq!(app.toast.as_deref(), Some("think → on"));
+}
+
+#[test]
+fn think_without_provider_toasts_and_stays_idle() {
+    let mut app = App::new();
+    for c in "/think".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    assert_eq!(app.toast.as_deref(), Some("no model connected"));
+    // No transcript entry — /think doesn't pollute the log.
+    assert!(app.transcript.is_empty());
 }
 
 #[test]
