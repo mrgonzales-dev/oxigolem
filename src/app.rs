@@ -13,6 +13,19 @@ pub enum View {
     Output,
 }
 
+#[derive(Clone)]
+pub enum Role {
+    User,
+    Golem,
+    Tool,
+}
+
+#[derive(Clone)]
+pub struct TranscriptEntry {
+    pub role: Role,
+    pub text: String,
+}
+
 /// One segment of the input buffer: typed text or a paste chip.
 #[derive(Clone)]
 pub enum InputPart {
@@ -28,6 +41,7 @@ pub struct App {
     pub modal: Option<Modal>,
     pub connected: Option<Connection>,
     pub toast: Option<String>,
+    pub transcript: Vec<TranscriptEntry>,
     providers: Vec<Box<dyn Provider>>,
 }
 
@@ -41,6 +55,7 @@ impl App {
             modal: None,
             connected: None,
             toast: None,
+            transcript: Vec::new(),
             providers: provider::registry(),
         }
     }

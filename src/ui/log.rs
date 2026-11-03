@@ -2,41 +2,60 @@ use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem},
+    widgets::{Block, Borders, Paragraph, Wrap},
     Frame,
 };
 
-use crate::theme::{FAINT, ORANGE, ORANGE_DIM, TEXT};
+use crate::{
+    app::{Role, TranscriptEntry},
+    theme::{FAINT, ORANGE, ORANGE_DIM, TEXT},
+};
 
-pub fn draw(f: &mut Frame, area: Rect) {
-    let entries = vec![
-        ("user", "list the files in this directory", FAINT),
-        ("golem", "$ ls -la", ORANGE),
-        ("tool", "returned 12 entries", ORANGE_DIM),
-        ("golem", "$ cat Cargo.toml", ORANGE),
-        ("tool", "returned 24 lines", ORANGE_DIM),
-        ("golem", "The project is a Rust binary with ratatui and crossterm.", TEXT),
-    ];
+fn role_label(role: &Role) -> (&'static str, ratatui::style::Color) {
+    match role {
+        Role::User => ("user", FAINT),
+        Role::Golem => ("golem", ORANGE),
+        Role::Tool => ("tool", ORANGE_DIM),
+    }
+}
 
-    let items: Vec<ListItem> = entries
-        .iter()
-        .map(|(role, text, color)| {
-            ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("{role:>6} "),
-                    Style::default().fg(*color).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(*text, Style::default().fg(TEXT)),
-            ]))
-        })
-        .collect();
+pub fn draw(f: &mut Frame, area: Rect, transcript: &[TranscriptEntry]) {
+    let mut lines: Vec<Line> = Vec::new();
 
-    let log = List::new(items).block(
-        Block::default()
-            .title(" oxigolem ")
-            .title_style(Style::default().fg(ORANGE))
-            .borders(Borders::ALL)
-            .border_style(Style::default().fg(FAINT)),
-    );
-    f.render_widget(log, area);
+    for entry in transcript {
+        let (label, color) = role_label(&entry.role);
+        match entry.role {
+            Role::Golem => {
+                let md = tui_markdown::from_str(&entry.text);
+                for line in md.lines {
+                    let mut prefixed = Line::default();
+                    prefixed.spans.push(Span::styled(
+                        format!("{label:>6} "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ));
+                    prefixed.spans.extend(line.spans);
+                    lines.push(prefixed);
+                }
+                lines.push(Line::default());
+            }
+            _ => {
+                lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("{label:>6} "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(entry.text.clone(), Style::default().fg(TEXT)),
+                ]));
+            }
+        }
+    }
+
+    let block = Block::default()
+        .title(" oxigolem ")
+        .title_style(Style::default().fg(ORANGE))
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(FAINT));
+
+    let p = Paragraph::new(lines).wrap(Wrap { trim: false }).block(block);
+    f.render_widget(p, area);
 }

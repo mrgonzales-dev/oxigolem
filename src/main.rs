@@ -90,7 +90,7 @@ fn draw(f: &mut ratatui::Frame, app: &App) {
         .split(area);
 
     match app.view {
-        View::Agent => ui::log::draw(f, root[0]),
+        View::Agent => ui::log::draw(f, root[0], &app.transcript),
         View::Output => ui::output::draw(f, root[0], &app.term_lines),
     }
 
