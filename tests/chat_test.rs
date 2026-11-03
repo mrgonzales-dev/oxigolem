@@ -236,6 +236,60 @@ fn ollama_chat_error_surfaces_server_message() {
 }
 
 #[test]
+fn ollama_chat_tolerates_abrupt_close_mid_stream() {
+    // Server sends tokens then closes WITHOUT a done:true chunk and
+    // without a proper chunked terminator. We already received usable
+    // content, so the abrupt close should be treated as end-of-stream,
+    // not a "decoding chunks" error.
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"content\":\"partial answer\"}}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{}\r\n",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+        stream.shutdown(std::net::Shutdown::Both).ok();
+    });
+
+    let provider = Ollama::new(host);
+    let tokens = RefCell::new(Vec::new());
+    let res = provider.chat(
+        "m",
+        &[Message { role: "user".into(), content: "hi".into() }],
+        &|t| tokens.borrow_mut().push(t),
+    );
+    assert!(res.is_ok(), "expected Ok, got {res:?}");
+    assert_eq!(*tokens.borrow(), vec!["partial answer"]);
+}
+
+#[test]
+fn ollama_chat_surfaces_thinking() {
+    // Thinking models emit chunks where content is empty but thinking is
+    // set. We should surface the thinking text so the transcript isn't
+    // silent while the model reasons.
+    let host = fake_ollama(|stream| {
+        let body = "{\"message\":{\"content\":\"\",\"thinking\":\"hmm\"}}\n\
+                    {\"message\":{\"content\":\"answer\"}}\n{\"done\":true}\n";
+        let resp = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        stream.write_all(resp.as_bytes()).unwrap();
+    });
+
+    let provider = Ollama::new(host);
+    let tokens = RefCell::new(Vec::new());
+    provider
+        .chat("m", &[Message { role: "user".into(), content: "hi".into() }], &|t| {
+            tokens.borrow_mut().push(t)
+        })
+        .unwrap();
+    assert_eq!(*tokens.borrow(), vec!["hmm", "answer"]);
+}
+
+#[test]
 fn app_chat_error_goes_to_transcript() {
     struct ErrorProvider;
     impl Provider for ErrorProvider {

@@ -102,25 +102,54 @@ impl Provider for Ollama {
             .send_json(body)
             .map_err(|e| chat_error(&url, e))?;
 
-        let reader = BufReader::new(response.into_reader());
+        let mut reader = BufReader::new(response.into_reader());
         let mut got_any = false;
+        let mut finished = false;
 
-        for line in reader.lines() {
-            let line = line.map_err(|e| format!("stream read error: {e}"))?;
-            if line.is_empty() {
-                continue;
+        let mut buf = String::new();
+        loop {
+            buf.clear();
+            match reader.read_line(&mut buf) {
+                // Clean EOF: connection closed (with or without done:true).
+                Ok(0) => break,
+                Ok(_) => {}
+                // A mid-stream read/decode error (e.g. "Error while decoding
+                // chunks" when the server resets between chunks) is only fatal
+                // if we got no usable text yet.
+                Err(e) => {
+                    if got_any {
+                        break;
+                    }
+                    return Err(format!("stream read error: {e}"));
+                }
             }
-            let v: serde_json::Value =
-                serde_json::from_str(&line).map_err(|e| format!("bad NDJSON line: {e}"))?;
 
-            if v["done"].as_bool() == Some(true) {
+            for line in buf.lines() {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                let Ok(v) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue; // skip partial/garbled line
+                };
+                if v["done"].as_bool() == Some(true) {
+                    finished = true;
+                    break;
+                }
+                // Thinking models put reasoning in `thinking`, answer in
+                // `content`. Surface whichever is present.
+                let piece = v["message"]["content"]
+                    .as_str()
+                    .filter(|s| !s.is_empty())
+                    .or_else(|| v["message"]["thinking"].as_str())
+                    .filter(|s| !s.is_empty());
+                if let Some(piece) = piece {
+                    got_any = true;
+                    on_token(piece.to_string());
+                }
+            }
+            if finished {
                 break;
-            }
-            if let Some(content) = v["message"]["content"].as_str()
-                && !content.is_empty()
-            {
-                got_any = true;
-                on_token(content.to_string());
             }
         }
 
