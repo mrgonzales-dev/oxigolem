@@ -235,13 +235,7 @@ impl App {
         };
         self.modal = match m.kind {
             Kind::Palette if choice.starts_with("/doctor") => {
-                let report = self.doctor_report();
-                self.transcript.push(TranscriptEntry {
-                    role: Role::Report,
-                    text: report,
-                    outcome: None,
-                    expanded: true,
-                });
+                self.push_doctor_report();
                 None
             }
             Kind::Palette => Some(Modal::new(Kind::Providers)),
@@ -354,6 +348,31 @@ impl App {
                     _ => Modal::new(Kind::Message(e)),
                 }
             }
+        });
+    }
+
+    /// Try to run `text` as a slash command. Returns true when handled
+    /// — caller should treat the input as consumed. Unknown commands
+    /// return false so the model still sees them (the user may be
+    /// asking about a literal `/path`).
+    fn try_slash_command(&mut self, text: &str) -> bool {
+        // Match the command word — `/doctor extra args` still hits.
+        match text.split_whitespace().next() {
+            Some("/doctor") => {
+                self.push_doctor_report();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Push the /doctor report as a transcript entry.
+    fn push_doctor_report(&mut self) {
+        self.transcript.push(TranscriptEntry {
+            role: Role::Report,
+            text: self.doctor_report(),
+            outcome: None,
+            expanded: true,
         });
     }
 
@@ -550,12 +569,21 @@ impl App {
     /// the in-flight reply and jumps the queue so this prompt goes next.
     /// Esc is the only key that cancels without a new prompt.
     pub fn send_chat(&mut self) {
+        let text = self.input_expanded();
+        let text = text.trim().to_string();
+
+        // Slash commands intercept before the provider check — they
+        // never reach the model and must work unconnected (`/doctor`
+        // reports "no model connected" itself).
+        if text.starts_with('/') && self.try_slash_command(&text) {
+            self.parts.clear();
+            return;
+        }
+
         if self.chat.is_none() {
             self.toast = Some("No provider connected — Ctrl+P to connect".to_string());
             return;
         }
-        let text = self.input_expanded();
-        let text = text.trim().to_string();
 
         if self.chat.as_ref().unwrap().is_busy() {
             if text.is_empty() {

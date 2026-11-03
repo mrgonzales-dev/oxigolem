@@ -64,6 +64,63 @@ fn doctor_without_connection_reports_no_model() {
 }
 
 #[test]
+fn doctor_via_input_slash_command_works_without_provider() {
+    let mut app = App::new();
+    // Type `/doctor` into the input and press Enter — no palette.
+    for c in "/doctor".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    let last = app.transcript.last().expect("report pushed");
+    assert_eq!(last.role, Role::Report);
+    assert!(last.text.contains("/doctor"));
+    assert!(last.text.contains("no model connected"));
+    // Slash command must not flow into chat (there is none anyway).
+    assert!(app.chat.is_none());
+}
+
+#[test]
+fn doctor_via_input_slash_command_works_when_connected() {
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(Dummy), "m".into()));
+    for c in "/doctor".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    let last = app.transcript.last().expect("report pushed");
+    assert_eq!(last.role, Role::Report);
+    // And no generation got kicked off — the engine stays idle.
+    assert!(!app.chat.as_ref().unwrap().is_busy());
+}
+
+#[test]
+fn slash_like_non_command_text_reaches_model() {
+    // `/etc/passwd` should be treated as a normal prompt, not a
+    // failed slash command — the model must see it verbatim.
+    let mut app = App::new();
+    app.chat = Some(ChatEngine::new(Arc::new(Dummy), "m".into()));
+    for c in "/etc/passwd".chars() {
+        app.push_char(c);
+    }
+    app.handle_enter();
+    for _ in 0..50 {
+        if !app.chat.as_ref().unwrap().is_busy() {
+            break;
+        }
+        app.poll_chat();
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    app.poll_chat();
+    // The user message lives in engine history — report a Report
+    // would have been pushed if /etc were misinterpreted as a cmd.
+    let report = app
+        .transcript
+        .iter()
+        .find(|e| matches!(e.role, Role::Report));
+    assert!(report.is_none(), "/etc/passwd wrongly hit Report path");
+}
+
+#[test]
 fn doctor_reports_model_ctx_tools_and_usage() {
     let mut app = App::new();
     app.chat = Some(ChatEngine::new(Arc::new(Dummy), "qwen3:1.7b".into()));
