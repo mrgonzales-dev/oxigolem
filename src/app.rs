@@ -334,7 +334,12 @@ impl App {
                         .rev()
                         .collect();
                     engine.record_assistant(text);
-                    self.gen_done_tick = Some(self.tick);
+                    // Don't re-stamp — the thinking→reply transition
+                    // already started the fade; a fresh stamp would
+                    // re-light the thinking block at end of generation.
+                    if self.gen_done_tick.is_none() {
+                        self.gen_done_tick = Some(self.tick);
+                    }
                 }
                 ChatEvent::Error(e) => {
                     while let Some(last) = self.transcript.last()
